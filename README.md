@@ -43,7 +43,7 @@ When `cmdtrace stop` runs, it captures the ending state and compares the two sna
 
 This detects changes such as:
 
-- Packages installed or removed
+- Packages installed, removed, or updated
 - Users and groups added or removed
 - Firewall changes
 - Services changed
@@ -470,7 +470,7 @@ The current script includes detectors covering:
 | Storage & Mounts | Mount information |
 | Container Runtimes | Docker and Podman state |
 | Network Identity & Routing | IP addresses, routes, hosts, resolver configuration |
-| Software Packages | `dpkg` or `rpm` inventory |
+| Software Packages | `dpkg` or `rpm` inventory | Install, Remove, Updates |
 | Systemd Services & Dependencies | Service units and states |
 | Process Activity | Processes, owners, PPIDs, open file descriptors |
 | Network Ports & Sockets | TCP/UDP listeners |
