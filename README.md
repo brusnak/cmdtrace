@@ -617,12 +617,6 @@ class MarkerFileDetector(BaseDetector):
         }
 ```
 
-The example above is also provided as:
-
-```text
-cmdtrace_example_module.py
-```
-
 The module demonstrates the basic detector API:
 
 | Component | Purpose |
