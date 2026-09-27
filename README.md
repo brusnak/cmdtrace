@@ -26,6 +26,7 @@ The second capability is provided by a native Linux `inotify` filesystem event t
 - Persistent session history
 - Sensitive environment-variable value redaction
 - Modular detector architecture
+- Pluggable filesystem event collector architecture with a default Python `inotify` backend and an optional native backend
 - Runs as a single Python script with no third-party Python dependencies
 
 ---
@@ -496,12 +497,12 @@ The filesystem functionality intentionally uses two complementary mechanisms.
                          |
               +----------+----------+
               |                     |
-        State Snapshot       inotify Monitor
+        State Snapshot       Event Collector
               |                     |
               |              filesystem events
               |                     |
               |                     v
-              |              event JSONL log
+              |              JSONL event log
               |                     |
               +----------+----------+
                          |
@@ -525,6 +526,49 @@ The event timeline answers:
 > What filesystem activity occurred while tracing was running?
 
 Keeping both mechanisms avoids forcing one approach to do two different jobs.
+
+## Event Collector Architecture
+
+The collector layer is intentionally decoupled from the rest of the tool. The implementation now uses an abstract `EventCollector` interface, with the default backend provided by `PythonInotifyCollector` and an optional future/native backend represented by `NativeEventCollector`.
+
+This means the session lifecycle, report generation, and detector logic do not depend on whether the event source is implemented in Python with `ctypes` and Linux `inotify` or in a standalone native executable later.
+
+The current backend behavior is:
+
+- `cmdtrace` selects the configured backend via `load_config().get("event_collector", "python-inotify")`
+- the default collector is `python-inotify`
+- a native collector can be configured with the `native_collector` config value or the `CMDTRACE_NATIVE_COLLECTOR` environment variable
+- the collector starts as a detached subprocess with a per-session JSONL event file
+- the collector writes JSON events to that file and emits a `MONITOR_STARTED` readiness marker before `cmdtrace` continues
+- `cmdtrace` sends `SIGTERM` to the collector on stop, then reads back the normalized event stream and removes the temporary log
+
+This keeps the event protocol stable across backends. A native collector only needs to honor the same lifecycle contract:
+
+1. start with a session name and event-file path
+2. write JSONL events to the file
+3. emit a `MONITOR_STARTED` line after initialization
+4. exit cleanly on `SIGTERM`
+
+The normalized event stream is then consumed by the reporting layer the same way regardless of origin.
+
+## Event Collector Configuration
+
+The collector choice is controlled by the config file and environment:
+
+```json
+{
+  "event_collector": "python-inotify",
+  "native_collector": "/usr/local/bin/cmdtrace-native-collector"
+}
+```
+
+Or with the environment variable:
+
+```bash
+export CMDTRACE_NATIVE_COLLECTOR=/usr/local/bin/cmdtrace-native-collector
+```
+
+When `event_collector` is set to `native`, cmdtrace will use the configured native executable. Otherwise it stays on the default Python `inotify` backend.
 
 ---
 
