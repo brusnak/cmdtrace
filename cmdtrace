@@ -44,6 +44,7 @@ import struct
 from abc import ABC, abstractmethod
 from pathlib import Path
 from datetime import datetime, timedelta
+from typing import Optional, List, Dict, Any
 
 # ==============================================================================
 # GLOBAL CONFIGURATION & PERSISTENT WATCH STORE
@@ -100,6 +101,12 @@ IN_ISDIR = 0x40000000
 IN_IGNORED = 0x00008000
 IN_Q_OVERFLOW = 0x00004000
 IN_NONBLOCK = 0x00000800
+
+# Event collector architecture. The application talks to an abstract collector
+# interface so the event source can later move from Python/inotify to a native
+# Linux collector without changing cmdtrace's session, reporting, or CLI layers.
+DEFAULT_EVENT_COLLECTOR = "python-inotify"
+NATIVE_COLLECTOR_ENV = "CMDTRACE_NATIVE_COLLECTOR"
 
 
 def load_config() -> dict:
@@ -253,7 +260,7 @@ def _write_fs_event(fp, event: dict) -> None:
     fp.write(json.dumps(event, separators=(",", ":")) + "\n")
     fp.flush()
 
-def _run_filesystem_monitor(event_file: Path) -> int:
+def _run_inotify_collector(event_file: Path) -> int:
     stop_requested = False
     def request_stop(signum, frame):
         nonlocal stop_requested
@@ -379,86 +386,221 @@ def _run_filesystem_monitor(event_file: Path) -> int:
             pass
     return 0
 
-def start_filesystem_monitor(session: str) -> dict:
-    event_file = get_event_file(session)
-    try:
-        event_file.unlink()
-    except FileNotFoundError:
-        pass
-    script_path = str(Path(__file__).resolve())
-    cmd = [sys.executable, script_path, "_fswatch", "--event-file", str(event_file)]
-    try:
-        with open(os.devnull, "w") as devnull:
-            proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=devnull, stderr=devnull, start_new_session=True, close_fds=True)
+class EventCollector(ABC):
+    """Interface between cmdtrace and a live event collection backend.
 
-        # Do not let `cmdtrace start` return until the monitor has initialized
-        # and written its readiness marker. This closes the startup race where
-        # a user could create/change a file immediately after `start`.
-        ready_deadline = time.time() + 2.0
-        ready = False
-        while time.time() < ready_deadline:
-            if proc.poll() is not None:
-                break
-            try:
-                if event_file.exists():
-                    with open(event_file, "r") as f:
-                        if any('"event":"MONITOR_STARTED"' in line for line in f):
-                            ready = True
-                            break
-            except OSError:
-                pass
-            time.sleep(0.05)
+    The rest of cmdtrace only depends on this contract. A future native
+    collector can implement the same lifecycle while the reporting and
+    detector layers remain unchanged.
+    """
 
-        if not ready:
-            try:
-                proc.terminate()
-            except Exception:
-                pass
-            raise RuntimeError("filesystem event monitor did not become ready")
+    name = "abstract"
+    description = "Abstract event collector"
 
-        return {"pid": proc.pid, "event_file": str(event_file)}
-    except Exception as e:
-        print(f"Warning: could not start filesystem event monitor: {e}", file=sys.stderr)
-        return {}
+    @abstractmethod
+    def start(self, session: str) -> dict:
+        """Start collection and return persistent session metadata."""
+        raise NotImplementedError
 
-def stop_filesystem_monitor(meta: dict) -> list:
-    monitor = meta.get("filesystem_monitor", {})
-    pid = monitor.get("pid")
-    event_file = Path(monitor.get("event_file", "")) if monitor.get("event_file") else None
-    if pid:
-        try:
-            os.kill(int(pid), signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-        except Exception as e:
-            print(f"Warning: could not stop filesystem monitor PID {pid}: {e}", file=sys.stderr)
-        deadline = time.time() + 3.0
-        while time.time() < deadline:
-            try:
-                os.kill(int(pid), 0)
-                time.sleep(0.05)
-            except (ProcessLookupError, PermissionError):
-                break
-            except Exception:
-                break
-    events = []
-    if event_file and event_file.exists():
-        try:
-            with open(event_file, "r") as f:
-                for line in f:
-                    try:
-                        event = json.loads(line)
-                        if event.get("event") != "MONITOR_STARTED":
-                            events.append(event)
-                    except json.JSONDecodeError:
-                        continue
-        except Exception as e:
-            print(f"Warning: could not read filesystem event log: {e}", file=sys.stderr)
+    @abstractmethod
+    def stop(self, metadata: dict) -> list:
+        """Stop collection and return normalized event dictionaries."""
+        raise NotImplementedError
+
+
+class SubprocessEventCollector(EventCollector):
+    """Common lifecycle for collectors that run as detached helper processes."""
+
+    ready_event = "MONITOR_STARTED"
+
+    def _command(self, session: str, event_file: Path) -> list:
+        raise NotImplementedError
+
+    def start(self, session: str) -> dict:
+        event_file = get_event_file(session)
         try:
             event_file.unlink()
-        except Exception:
+        except FileNotFoundError:
             pass
-    return events
+
+        cmd = self._command(session, event_file)
+        try:
+            with open(os.devnull, "w") as devnull:
+                proc = subprocess.Popen(
+                    cmd,
+                    stdin=subprocess.DEVNULL,
+                    stdout=devnull,
+                    stderr=devnull,
+                    start_new_session=True,
+                    close_fds=True,
+                )
+
+            # cmdtrace start does not return until the collector has installed
+            # its watches and emitted its readiness marker. This prevents the
+            # caller from immediately changing a file in a startup race.
+            ready_deadline = time.time() + 3.0
+            ready = False
+            while time.time() < ready_deadline:
+                if proc.poll() is not None:
+                    break
+                try:
+                    if event_file.exists():
+                        with open(event_file, "r") as f:
+                            if any(f'"event":"{self.ready_event}"' in line for line in f):
+                                ready = True
+                                break
+                except OSError:
+                    pass
+                time.sleep(0.05)
+
+            if not ready:
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+                raise RuntimeError(f"{self.name} did not become ready")
+
+            meta = {
+                "backend": self.name,
+                "pid": proc.pid,
+                "event_file": str(event_file),
+            }
+            if isinstance(self, NativeEventCollector):
+                meta["executable"] = self.executable
+            return meta
+        except Exception as e:
+            print(f"Warning: could not start {self.name}: {e}", file=sys.stderr)
+            return {}
+
+    def stop(self, metadata: dict) -> list:
+        pid = metadata.get("pid")
+        event_file = Path(metadata.get("event_file", "")) if metadata.get("event_file") else None
+
+        if pid:
+            try:
+                os.kill(int(pid), signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            except Exception as e:
+                print(f"Warning: could not stop collector PID {pid}: {e}", file=sys.stderr)
+
+            deadline = time.time() + 3.0
+            while time.time() < deadline:
+                try:
+                    os.kill(int(pid), 0)
+                    time.sleep(0.05)
+                except (ProcessLookupError, PermissionError):
+                    break
+                except Exception:
+                    break
+
+        events = []
+        if event_file and event_file.exists():
+            try:
+                with open(event_file, "r") as f:
+                    for line in f:
+                        try:
+                            event = json.loads(line)
+                            if event.get("event") != self.ready_event:
+                                events.append(event)
+                        except json.JSONDecodeError:
+                            continue
+            except Exception as e:
+                print(f"Warning: could not read collector event log: {e}", file=sys.stderr)
+            try:
+                event_file.unlink()
+            except Exception:
+                pass
+        return events
+
+
+class PythonInotifyCollector(SubprocessEventCollector):
+    """Current collector backend: native Linux inotify accessed from Python ctypes."""
+
+    name = "python-inotify"
+    description = "Python ctypes wrapper around the Linux inotify API"
+
+    def _command(self, session: str, event_file: Path) -> list:
+        script_path = str(Path(__file__).resolve())
+        return [
+            sys.executable,
+            script_path,
+            "_collector",
+            "--backend",
+            self.name,
+            "--session",
+            session,
+            "--event-file",
+            str(event_file),
+        ]
+
+
+class NativeEventCollector(SubprocessEventCollector):
+    """Future native backend using an external collector executable.
+
+    The native program only needs to honor the cmdtrace event-file protocol:
+    write JSONL events, emit MONITOR_STARTED after initialization, and exit on
+    SIGTERM. This keeps the eventual C/C++/Rust collector independent of the
+    Python application.
+    """
+
+    name = "native"
+    description = "External native Linux event collector"
+
+    def __init__(self, executable: str):
+        self.executable = executable
+
+    def _command(self, session: str, event_file: Path) -> list:
+        return [
+            self.executable,
+            "--session",
+            session,
+            "--event-file",
+            str(event_file),
+        ]
+
+
+def get_event_collector() -> EventCollector:
+    """Select the event backend without coupling the application to its implementation."""
+    configured = load_config().get("event_collector", DEFAULT_EVENT_COLLECTOR)
+    native_executable = load_config().get("native_collector") or os.environ.get(NATIVE_COLLECTOR_ENV)
+
+    if configured == "native":
+        if not native_executable:
+            raise RuntimeError(
+                "event_collector is 'native' but no native collector executable is configured; "
+                f"set '{NATIVE_COLLECTOR_ENV}' or add 'native_collector' to {CONFIG_FILE}"
+            )
+        return NativeEventCollector(native_executable)
+
+    if configured != DEFAULT_EVENT_COLLECTOR:
+        raise RuntimeError(f"Unsupported event collector backend: {configured}")
+
+    return PythonInotifyCollector()
+
+
+def start_event_collector(session: str) -> dict:
+    """Start the configured collector and return session metadata."""
+    try:
+        return get_event_collector().start(session)
+    except Exception as e:
+        print(f"Warning: event collector unavailable: {e}", file=sys.stderr)
+        return {}
+
+
+def stop_event_collector(metadata: dict) -> list:
+    """Stop the collector recorded in session metadata and return its events."""
+    backend = metadata.get("backend", DEFAULT_EVENT_COLLECTOR)
+    if backend == "native":
+        executable = metadata.get("executable") or load_config().get("native_collector") or os.environ.get(NATIVE_COLLECTOR_ENV)
+        if not executable:
+            print("Warning: native collector executable is no longer configured", file=sys.stderr)
+            return []
+        collector = NativeEventCollector(executable)
+    else:
+        collector = PythonInotifyCollector()
+    return collector.stop(metadata)
+
 
 def render_filesystem_activity(events: list) -> None:
     if not events:
@@ -1506,7 +1648,13 @@ USAGE PATTERNS:
   6. CI / Automation Gate:
      sudo cmdtrace run --fail-on-change -- ./deploy.sh   # non-zero exit if anything changed
 
-  7. Dynamic Watch List & Ignore Pattern Management:
+  7. Event Collector Architecture:
+     The live filesystem timeline is collected through a replaceable event
+     collector interface. The default backend uses Linux inotify through
+     Python ctypes. A future native collector can emit the same JSONL event
+     protocol without changing cmdtrace's reporting or detector layers.
+
+  8. Dynamic Watch List & Ignore Pattern Management:
      sudo cmdtrace watch list
      sudo cmdtrace watch add /etc/nginx
      sudo cmdtrace watch remove /var/www
@@ -1550,6 +1698,7 @@ IGNORED PATTERNS ({len(current_ignores)} PATTERNS ACTIVE):
   Persistent config: {CONFIG_FILE}
   Saved baselines:   {BASELINE_DIR}
   History log:       {HISTORY_LOG_FILE}
+  Event collector:   {load_config().get("event_collector", DEFAULT_EVENT_COLLECTOR)}
 ================================================================================
 """
     print(help_text)
@@ -1643,9 +1792,9 @@ def cmd_start(session: str = "default"):
         snapshot_file.parent.mkdir(parents=True, exist_ok=True)
         with open(snapshot_file, "w") as f:
             json.dump(snapshot, f)
-        monitor_meta = start_filesystem_monitor(session)
+        monitor_meta = start_event_collector(session)
         if monitor_meta:
-            snapshot["_meta"]["filesystem_monitor"] = monitor_meta
+            snapshot["_meta"]["event_collector"] = monitor_meta
             with open(snapshot_file, "w") as f:
                 json.dump(snapshot, f)
             print(f"Baseline captured successfully at {datetime.now().strftime('%H:%M:%S')} ({len(detectors)} modules).")
@@ -1674,7 +1823,7 @@ def cmd_stop(session: str = "default", export_arg: str = None, export_format: st
         print(f"Error loading snapshot: {e}", file=sys.stderr)
         sys.exit(1)
 
-    filesystem_events = stop_filesystem_monitor(start_snapshot.get("_meta", {}))
+    filesystem_events = stop_event_collector(start_snapshot.get("_meta", {}).get("event_collector", {}))
     meta_stop = {"timestamp": time.time()}
     detectors = get_all_detectors()
     stop_subsystems = collect_all(detectors)
@@ -1837,13 +1986,18 @@ def main():
     ig_rm.add_argument("pattern", help="Glob pattern to remove")
 
     # Internal command used by start to keep the monitor alive after start exits.
-    fswatch_parser = subparsers.add_parser("_fswatch", help=argparse.SUPPRESS)
-    fswatch_parser.add_argument("--event-file", required=True)
+    collector_parser = subparsers.add_parser("_collector", help=argparse.SUPPRESS)
+    collector_parser.add_argument("--backend", choices=["python-inotify"], required=True)
+    collector_parser.add_argument("--session", required=True)
+    collector_parser.add_argument("--event-file", required=True)
 
     args = parser.parse_args()
 
-    if args.command == "_fswatch":
-        sys.exit(_run_filesystem_monitor(Path(args.event_file)))
+    if args.command == "_collector":
+        if args.backend == "python-inotify":
+            sys.exit(_run_inotify_collector(Path(args.event_file)))
+        print(f"Unsupported collector backend: {args.backend}", file=sys.stderr)
+        sys.exit(1)
     elif args.command == "start":
         cmd_start(session=args.session)
     elif args.command == "stop":
