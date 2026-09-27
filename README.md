@@ -373,17 +373,67 @@ The same export options are available with `run` and `compare`.
 
 # Automation / CI
 
-Use `--fail-on-change` when cmdtrace should return a non-zero status if tracked changes are detected.
+## `--fail-on-change`
 
-Example:
+`--fail-on-change` is a **post-operation validation gate**. It does not stop a command at the moment a change occurs. Instead, cmdtrace lets the operation finish, performs its normal change detection, and then returns exit status `2` if a tracked change was found.
+
+For example:
 
 ```bash
 sudo cmdtrace run --fail-on-change -- ./deploy.sh
 ```
 
-A detected change causes cmdtrace to exit with status `2`.
+The sequence is:
 
-This can be useful in automation where the report is informational but the presence of a system change should cause a pipeline or validation step to fail.
+```text
+start tracing
+     │
+     ▼
+run ./deploy.sh
+     │
+     │  system changes may occur here
+     │
+     ▼
+stop tracing / collect final state
+     │
+     ▼
+compare before vs. after
+     │
+     ├── no tracked changes ──► exit 0
+     │
+     └── changes detected ────► exit 2
+```
+
+This makes the option useful in CI/CD, deployment verification, and automated validation where the requirement is:
+
+> **Run the operation, then fail the job if it left the system in a changed state.**
+
+For example, a deployment script might be expected to make certain changes. If it unexpectedly changes another tracked subsystem, the cmdtrace step can return `2` and cause the surrounding pipeline to flag the operation.
+
+### What it does not do
+
+`--fail-on-change` is **not a real-time protection mechanism**. If a command creates a file, changes its permissions, and then deletes it during the operation, the final snapshot may not show that the file ever existed. The option therefore should not be interpreted as “terminate immediately when anything changes.”
+
+The filesystem event timeline provides additional visibility into activity that occurred during the session, including intermediate events such as create, permission changes, writes, and deletes. That timeline is primarily for investigation and reporting; it is separate from the `--fail-on-change` exit-code gate.
+
+If real-time enforcement is needed in the future, that would be a separate feature with different semantics, such as configurable rules for which events should cause an operation to be terminated.
+
+### `--fail-on-change` with other commands
+
+The option is available anywhere cmdtrace performs a change comparison:
+
+```bash
+# Automatic command tracing
+sudo cmdtrace run --fail-on-change -- ./deploy.sh
+
+# Start/stop tracing
+sudo cmdtrace stop --fail-on-change
+
+# Compare against a saved baseline
+sudo cmdtrace compare known_good --fail-on-change
+```
+
+In all cases, the meaning is the same: **complete the comparison, then use the exit status to indicate whether tracked changes were detected.**
 
 ---
 
