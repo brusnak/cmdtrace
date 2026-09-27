@@ -486,6 +486,258 @@ cmdtrace help
 
 ---
 
+# Modular Detector Architecture
+
+cmdtrace includes its core detectors directly in the main script, while also supporting optional external detector modules.
+
+This provides two layers:
+
+```text
+cmdtrace
+   |
+   +-- Built-in detectors
+   |      Users/Auth
+   |      Kernel/Hardware
+   |      Packages
+   |      Services
+   |      Filesystem
+   |      ...
+   |
+   +-- External detector modules
+          /etc/cmdtrace/modules/*.py
+```
+
+Built-in detectors are always loaded first. External modules are then discovered from the configured module directory and added to the detector registry.
+
+This allows site-specific or team-specific checks to be added without modifying the main cmdtrace script.
+
+## Configuring the Module Path
+
+The default external module directory is:
+
+```text
+/etc/cmdtrace/modules
+```
+
+The path can be changed with:
+
+```bash
+sudo cmdtrace set module path /etc/cmdtrace/modules
+```
+
+For example:
+
+```bash
+sudo cmdtrace set module path /opt/cmdtrace/modules
+```
+
+The configured path is stored in the cmdtrace configuration file and is used by future cmdtrace executions.
+
+The directory does not have to exist when the path is configured. cmdtrace will save the configuration and warn if the directory is not currently available.
+
+## Listing Detectors
+
+Use:
+
+```bash
+cmdtrace modules
+```
+
+to display the built-in and externally loaded detectors.
+
+The output identifies:
+
+- Built-in detectors
+- External detectors
+- Detector names and descriptions
+- The source path of external modules
+- The configured module directory
+- External module loading errors, if any
+
+Built-in detectors are listed before external detectors.
+
+## Building an External Detector
+
+An external detector is a normal Python module containing a class derived from `BaseDetector`.
+
+A minimal module looks like this:
+
+```python
+from pathlib import Path
+
+from cmdtrace import BaseDetector, hash_file
+
+
+TEST_FILE = Path("/var/tmp/cmdtrace_module_test.txt")
+
+
+class MarkerFileDetector(BaseDetector):
+    key = "example.marker_file"
+    name = "Module Test File"
+    description = "Example external module tracking /var/tmp/cmdtrace_module_test.txt"
+
+    def collect(self) -> dict:
+        return {
+            "path": str(TEST_FILE),
+            "exists": TEST_FILE.exists(),
+            "sha256": hash_file(TEST_FILE),
+        }
+
+    def diff(self, start, stop, meta_start, meta_stop) -> dict:
+        return {
+            "created": not start.get("exists", False) and stop.get("exists", False),
+            "deleted": start.get("exists", False) and not stop.get("exists", False),
+            "content_changed": (
+                start.get("exists", False)
+                and stop.get("exists", False)
+                and start.get("sha256", "") != stop.get("sha256", "")
+            ),
+        }
+
+    def render(self, diff_data) -> None:
+        if not any(diff_data.values()):
+            return
+
+        print("MODULE TEST FILE")
+
+        if diff_data["created"]:
+            print(f"  + Created: {TEST_FILE}")
+
+        if diff_data["deleted"]:
+            print(f"  - Deleted: {TEST_FILE}")
+
+        if diff_data["content_changed"]:
+            print(f"  ~ Content changed: {TEST_FILE}")
+
+        print()
+
+    def summary_metrics(self, diff_data) -> dict:
+        return {
+            "Module Test File Changes": int(any(diff_data.values()))
+        }
+```
+
+The example above is also provided as:
+
+```text
+cmdtrace_example_module.py
+```
+
+The module demonstrates the basic detector API:
+
+| Component | Purpose |
+|---|---|
+| `BaseDetector` | Base class for cmdtrace detectors |
+| `key` | Optional stable identifier for the detector |
+| `name` | Human-readable detector name |
+| `description` | Description shown by `cmdtrace modules` |
+| `collect()` | Captures detector-specific state |
+| `diff()` | Compares beginning and ending state |
+| `render()` | Adds human-readable changes to the report |
+| `summary_metrics()` | Optional summary statistics |
+
+`summary_metrics()` is optional. The other detector methods provide the core collection, comparison, and reporting behavior.
+
+### Detector Keys
+
+Built-in detectors retain their existing detector keys for compatibility.
+
+External detectors should preferably define an explicit `key`, for example:
+
+```python
+key = "example.marker_file"
+```
+
+If an external detector does not define a key, cmdtrace automatically namespaces it using its Python module and class name. This prevents an external class from accidentally overwriting a built-in detector's snapshot/report data simply because it happens to use the same class name.
+
+### External Module Loading Rules
+
+External modules are loaded from the configured module directory:
+
+- Only `.py` files are considered.
+- Files beginning with `_` are ignored.
+- External modules are loaded after all built-in detectors.
+- External modules are loaded alphabetically by filename.
+- A failure in one external module is reported as a warning and does not prevent the built-in detectors from running.
+- Modules are loaded once per cmdtrace process.
+
+This makes the built-in detector set reliable even when a site-specific module contains an error.
+
+## Installing the Example Module
+
+Create the module directory:
+
+```bash
+sudo mkdir -p /etc/cmdtrace/modules
+```
+
+Copy the example detector:
+
+```bash
+sudo cp cmdtrace_example_module.py /etc/cmdtrace/modules/
+```
+
+Configure the module path:
+
+```bash
+sudo cmdtrace set module path /etc/cmdtrace/modules
+```
+
+Verify that it loaded:
+
+```bash
+sudo cmdtrace modules
+```
+
+The example module tracks:
+
+```text
+/var/tmp/cmdtrace_module_test.txt
+```
+
+Test it with:
+
+```bash
+echo "before" | sudo tee /var/tmp/cmdtrace_module_test.txt
+sudo cmdtrace start
+
+echo "after" | sudo tee /var/tmp/cmdtrace_module_test.txt
+
+sudo cmdtrace stop
+```
+
+The resulting report includes a module-specific section similar to:
+
+```text
+MODULE TEST FILE
+  ~ Content changed: /var/tmp/cmdtrace_module_test.txt
+```
+
+and the summary can include:
+
+```text
+Module Test File Changes: 1
+```
+
+The example is intentionally simple. A production module could instead collect state from a site-specific configuration file, application, service, database, API, or other system resource that is not covered by the built-in detectors.
+
+## Module Design Philosophy
+
+The modular detector system is intentionally lightweight. External modules do not need to implement a separate plugin framework or install third-party Python packages.
+
+A detector is responsible for:
+
+1. Collecting its own state.
+2. Comparing the start and stop state.
+3. Rendering meaningful changes.
+4. Optionally providing summary metrics.
+
+The main cmdtrace application remains responsible for session management, snapshot persistence, report generation, history, and command-line behavior.
+
+This keeps site-specific detection logic isolated while allowing all detectors to participate in the same start/stop comparison and reporting pipeline.
+
+---
+
 # Filesystem Monitoring Architecture
 
 The filesystem functionality intentionally uses two complementary mechanisms.
@@ -695,6 +947,7 @@ cmdtrace is intended to be useful for:
 - Before/after testing of installation scripts
 - CI/CD environment validation
 - Understanding what an unfamiliar installer or maintenance script changes
+- Extending system change detection with site-specific external detector modules
 
 The design goal is to provide useful system visibility without requiring a large external monitoring stack.
 

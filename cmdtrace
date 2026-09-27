@@ -108,6 +108,16 @@ IN_NONBLOCK = 0x00000800
 DEFAULT_EVENT_COLLECTOR = "python-inotify"
 NATIVE_COLLECTOR_ENV = "CMDTRACE_NATIVE_COLLECTOR"
 
+# Detector modules are intentionally split into two tiers:
+#   1. Built-in detectors defined in this file (always loaded first).
+#   2. Optional external detector modules loaded from the configured path.
+# The external modules use the same BaseDetector contract as built-ins.
+DEFAULT_MODULE_PATH = "/etc/cmdtrace/modules"
+MODULE_PATH_CONFIG_KEY = "module_path"
+_EXTERNAL_MODULES_LOADED = False
+_EXTERNAL_MODULE_FILES = []
+_EXTERNAL_MODULE_ERRORS = []
+
 
 def load_config() -> dict:
     """Load the full persistent config (watch dirs + ignore patterns), falling back to defaults."""
@@ -156,6 +166,22 @@ def save_ignore_patterns(patterns: list) -> bool:
     """Save the ignore-pattern list persistently to disk."""
     cfg = load_config()
     cfg["ignore_patterns"] = sorted(set(patterns))
+    return save_config(cfg)
+
+
+def load_module_path() -> Optional[Path]:
+    """Return the configured external detector-module directory, if one is set."""
+    configured = load_config().get(MODULE_PATH_CONFIG_KEY)
+    if not configured:
+        return None
+    return Path(configured).expanduser().resolve()
+
+
+def save_module_path(path_str: str) -> bool:
+    """Persist the external detector-module directory."""
+    path = Path(path_str).expanduser().resolve()
+    cfg = load_config()
+    cfg[MODULE_PATH_CONFIG_KEY] = str(path)
     return save_config(cfg)
 
 
@@ -653,10 +679,14 @@ def filesystem_activity_metrics(events: list) -> dict:
 class BaseDetector(ABC):
     """
     Abstract Base Class for all cmdtrace subsystem monitors.
-    Subclasses automatically register with the engine upon definition.
+
+    External modules should subclass this class and provide at least `name`,
+    `description`, `collect()`, `diff()`, and `render()`. An optional `key`
+    may be supplied to give the detector a stable snapshot/report identifier.
     """
     name: str = "Base Detector"
     description: str = "Base detector description"
+    key: Optional[str] = None
 
     @abstractmethod
     def collect(self) -> dict:
@@ -688,21 +718,77 @@ class BaseDetector(ABC):
             return any(bool(v) for v in diff_data.values())
         return bool(diff_data)
 
+    def detector_key(self) -> str:
+        """Return the stable key used for snapshot and report storage."""
+        if self.key:
+            return self.key
+        if self.__class__ in _BUILTIN_DETECTOR_CLASSES:
+            return self.__class__.__name__
+        return f"external:{self.__class__.__module__}.{self.__class__.__name__}"
+
     def get_help_text(self) -> str:
         """Return formatted string entry for 'cmdtrace help'."""
         return f"  • {self.name:<28} {self.description}"
 
 
+def load_external_detector_modules() -> None:
+    """Load optional detector modules from the configured module directory.
+
+    Built-in detectors remain defined in this script and are never replaced by
+    external modules. External modules are loaded alphabetically and only once
+    per cmdtrace process. A bad optional module is reported but does not prevent
+    the built-in detector set from running.
+    """
+    global _EXTERNAL_MODULES_LOADED, _EXTERNAL_MODULE_FILES, _EXTERNAL_MODULE_ERRORS
+    if _EXTERNAL_MODULES_LOADED:
+        return
+    _EXTERNAL_MODULES_LOADED = True
+
+    module_path = load_module_path()
+    if module_path is None or not module_path.is_dir():
+        return
+
+    # When cmdtrace is executed directly, Python calls this module __main__.
+    # External modules use `from cmdtrace import BaseDetector`; aliasing the
+    # running module prevents Python from loading a second cmdtrace instance.
+    sys.modules.setdefault("cmdtrace", sys.modules[__name__])
+
+    import importlib.util
+
+    for module_file in sorted(module_path.glob("*.py")):
+        if module_file.name.startswith("_"):
+            continue
+
+        module_name = f"cmdtrace_external_{module_file.stem}"
+        try:
+            spec = importlib.util.spec_from_file_location(module_name, module_file)
+            if spec is None or spec.loader is None:
+                raise ImportError("could not create import specification")
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[module_name] = module
+            spec.loader.exec_module(module)
+            _EXTERNAL_MODULE_FILES.append(str(module_file))
+        except Exception as exc:
+            _EXTERNAL_MODULE_ERRORS.append({"file": str(module_file), "error": str(exc)})
+            print(f"Warning: external detector module '{module_file}' failed to load: {exc}", file=sys.stderr)
+
+
 def get_all_detectors() -> list:
-    """Instantiate and return all detector classes registered via BaseDetector subclasses."""
-    return [cls() for cls in BaseDetector.__subclasses__()]
+    """Return built-in detectors first, followed by optional external detectors."""
+    load_external_detector_modules()
+    classes = list(_BUILTIN_DETECTOR_CLASSES)
+    builtin_ids = {id(cls) for cls in classes}
+    for cls in BaseDetector.__subclasses__():
+        if id(cls) not in builtin_ids:
+            classes.append(cls)
+    return [cls() for cls in classes]
 
 
 def collect_all(detectors: list) -> dict:
     """Run every detector's collect() concurrently and return {ClassName: data}."""
     results = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(len(detectors), 1)) as executor:
-        future_map = {executor.submit(d.collect): d.__class__.__name__ for d in detectors}
+        future_map = {executor.submit(d.collect): d.detector_key() for d in detectors}
         for future in concurrent.futures.as_completed(future_map):
             name = future_map[future]
             try:
@@ -769,45 +855,59 @@ class UsersAuthDetector(BaseDetector):
         }
 
     def diff(self, start: dict, stop: dict, meta_start: dict, meta_stop: dict) -> dict:
-        env_a, env_b = start.get("env_vars", {}), stop.get("env_vars", {})
-
-        # Only ever compare the redacted (fingerprinted) values below —
-        # actual secret values are never present in a collected snapshot.
-        sensitive_a = {k for k in env_a if SENSITIVE_ENV_NAME_PATTERN.search(k)}
-        sensitive_b = {k for k in env_b if SENSITIVE_ENV_NAME_PATTERN.search(k)}
+        users_a, users_b = start.get("users", {}), stop.get("users", {})
+        groups_a, groups_b = start.get("groups", {}), stop.get("groups", {})
+        ssh_a, ssh_b = start.get("ssh_keys", {}), stop.get("ssh_keys", {})
+        pam_a, pam_b = start.get("pam_hashes", {}), stop.get("pam_hashes", {})
 
         return {
-            "path_changed": start.get("path") != stop.get("path"),
-            "profiles_changed": start.get("profile_hashes") != stop.get("profile_hashes"),
-            "sensitive_vars_added": sorted(sensitive_b - sensitive_a),
-            "sensitive_vars_removed": sorted(sensitive_a - sensitive_b),
-            "sensitive_vars_changed": sorted(
-                k for k in sensitive_a & sensitive_b if env_a.get(k) != env_b.get(k)
+            "users_added": sorted(u for u in users_b if u not in users_a),
+            "users_removed": sorted(u for u in users_a if u not in users_b),
+            "groups_added": sorted(g for g in groups_b if g not in groups_a),
+            "groups_removed": sorted(g for g in groups_a if g not in groups_b),
+            "ssh_keys_changed": sorted(
+                u for u in set(ssh_a) | set(ssh_b) if ssh_a.get(u) != ssh_b.get(u)
+            ),
+            "sudoers_changed": start.get("sudoers_hash") != stop.get("sudoers_hash"),
+            "sshd_changed": start.get("sshd_hash") != stop.get("sshd_hash"),
+            "shadow_changed": start.get("shadow_hash") != stop.get("shadow_hash"),
+            "pam_changed_files": sorted(
+                f for f in set(pam_a) | set(pam_b) if pam_a.get(f) != pam_b.get(f)
             )
         }
 
     def render(self, diff_data: dict) -> None:
-        if (diff_data["path_changed"] or diff_data["profiles_changed"]
-                or diff_data["sensitive_vars_added"] or diff_data["sensitive_vars_removed"]
-                or diff_data["sensitive_vars_changed"]):
-            print("ENVIRONMENT CONFIGURATION")
-            if diff_data["path_changed"]:
-                print("  ~ Environment PATH variable modified")
-            if diff_data["profiles_changed"]:
-                print("  ~ System/User shell profile scripts modified")
-            for v in diff_data["sensitive_vars_changed"]:
-                print(f"  ! ALERT: Sensitive environment variable value changed: {v}")
-            for v in diff_data["sensitive_vars_added"]:
-                print(f"  ! ALERT: New sensitive environment variable set: {v}")
-            for v in diff_data["sensitive_vars_removed"]:
-                print(f"  ! ALERT: Sensitive environment variable removed: {v}")
+        if any(diff_data.values()):
+            print("USER, GROUP & SECURITY CONFIGURATION")
+            for u in diff_data["users_added"]:
+                print(f"  + User created: {u}")
+            for u in diff_data["users_removed"]:
+                print(f"  - User deleted: {u}")
+            for g in diff_data["groups_added"]:
+                print(f"  + Group created: {g}")
+            for g in diff_data["groups_removed"]:
+                print(f"  - Group deleted: {g}")
+            for u in diff_data["ssh_keys_changed"]:
+                print(f"  ! ALERT: SSH authorized_keys changed for user: {u}")
+            if diff_data["sudoers_changed"]:
+                print("  ! ALERT: /etc/sudoers file was modified")
+            if diff_data["sshd_changed"]:
+                print("  ! ALERT: /etc/ssh/sshd_config file was modified")
+            if diff_data["shadow_changed"]:
+                print("  ! ALERT: /etc/shadow file was modified")
+            if diff_data["pam_changed_files"]:
+                print(f"  ! ALERT: PAM configuration modified ({len(diff_data['pam_changed_files'])} file(s))")
+                for f in diff_data["pam_changed_files"][:5]:
+                    print(f"      - {f}")
             print()
 
     def summary_metrics(self, diff_data: dict) -> dict:
-        total = (len(diff_data.get("sensitive_vars_added", []))
-                 + len(diff_data.get("sensitive_vars_removed", []))
-                 + len(diff_data.get("sensitive_vars_changed", [])))
-        return {"Sensitive Env Var Changes": total}
+        return {
+            "Users Created": len(diff_data.get("users_added", [])),
+            "Users Removed": len(diff_data.get("users_removed", [])),
+            "Groups Changed": len(diff_data.get("groups_added", [])) + len(diff_data.get("groups_removed", [])),
+            "SSH Key Changes": len(diff_data.get("ssh_keys_changed", []))
+        }
 
 
 class KernelHardwareDetector(BaseDetector):
@@ -854,19 +954,42 @@ class ExecutionEnvDetector(BaseDetector):
         }
 
     def diff(self, start: dict, stop: dict, meta_start: dict, meta_stop: dict) -> dict:
+        env_a, env_b = start.get("env_vars", {}), stop.get("env_vars", {})
+        sensitive_a = {k for k in env_a if SENSITIVE_ENV_NAME_PATTERN.search(k)}
+        sensitive_b = {k for k in env_b if SENSITIVE_ENV_NAME_PATTERN.search(k)}
+
         return {
             "path_changed": start.get("path") != stop.get("path"),
-            "profiles_changed": start.get("profile_hashes") != stop.get("profile_hashes")
+            "profiles_changed": start.get("profile_hashes") != stop.get("profile_hashes"),
+            "sensitive_vars_added": sorted(sensitive_b - sensitive_a),
+            "sensitive_vars_removed": sorted(sensitive_a - sensitive_b),
+            "sensitive_vars_changed": sorted(
+                k for k in sensitive_a & sensitive_b if env_a.get(k) != env_b.get(k)
+            )
         }
 
     def render(self, diff_data: dict) -> None:
-        if diff_data["path_changed"] or diff_data["profiles_changed"]:
+        if (diff_data["path_changed"] or diff_data["profiles_changed"]
+                or diff_data["sensitive_vars_added"] or diff_data["sensitive_vars_removed"]
+                or diff_data["sensitive_vars_changed"]):
             print("ENVIRONMENT CONFIGURATION")
             if diff_data["path_changed"]:
                 print("  ~ Environment PATH variable modified")
             if diff_data["profiles_changed"]:
                 print("  ~ System/User shell profile scripts modified")
+            for v in diff_data["sensitive_vars_changed"]:
+                print(f"  ! ALERT: Sensitive environment variable value changed: {v}")
+            for v in diff_data["sensitive_vars_added"]:
+                print(f"  ! ALERT: New sensitive environment variable set: {v}")
+            for v in diff_data["sensitive_vars_removed"]:
+                print(f"  ! ALERT: Sensitive environment variable removed: {v}")
             print()
+
+    def summary_metrics(self, diff_data: dict) -> dict:
+        total = (len(diff_data.get("sensitive_vars_added", []))
+                 + len(diff_data.get("sensitive_vars_removed", []))
+                 + len(diff_data.get("sensitive_vars_changed", [])))
+        return {"Sensitive Env Var Changes": total}
 
 
 class ScheduledJobsDetector(BaseDetector):
@@ -1396,6 +1519,26 @@ class MySQLDetector(BaseDetector):
         # 4. Final summary box metric
         return {"Databases Created": len(diff_data.get("created", []))}
 
+# Explicit built-in registry. Keeping this list in source order guarantees that
+# built-in detectors always run first; external modules are appended afterward.
+_BUILTIN_DETECTOR_CLASSES = [
+    UsersAuthDetector,
+    KernelHardwareDetector,
+    ExecutionEnvDetector,
+    ScheduledJobsDetector,
+    FirewallDetector,
+    StorageDetector,
+    ContainerDetector,
+    NetworkIdentityDetector,
+    PackageDetector,
+    ServiceDepsDetector,
+    ProcessDetector,
+    SocketDetector,
+    FilesystemDetector,
+    JournalDetector,
+    MySQLDetector,
+]
+
 # ==============================================================================
 # WATCH MANAGEMENT HANDLERS
 # ==============================================================================
@@ -1477,6 +1620,46 @@ def cmd_ignore_remove(pattern: str):
     patterns.remove(pattern)
     if save_ignore_patterns(patterns):
         print(f"Successfully removed ignore pattern '{pattern}'.")
+
+
+def cmd_set_module_path(path_str: str) -> None:
+    """Set the persistent external detector module directory."""
+    path = Path(path_str).expanduser().resolve()
+    if path.exists() and not path.is_dir():
+        print(f"Error: '{path}' exists but is not a directory.", file=sys.stderr)
+        sys.exit(1)
+    if not path.exists():
+        print(f"Warning: '{path}' does not currently exist. The path will be saved anyway.", file=sys.stderr)
+    if save_module_path(str(path)):
+        print(f"External detector module path set to: {path}")
+
+
+def cmd_modules_list() -> None:
+    """Display built-in and externally loaded detector modules."""
+    load_external_detector_modules()
+    module_path = load_module_path()
+    print("CMDTRACE DETECTOR MODULES")
+    print("\nBUILT-IN DETECTORS:")
+    for cls in _BUILTIN_DETECTOR_CLASSES:
+        print(f"  • {cls.__name__:<30} {cls.name}")
+
+    print("\nEXTERNAL DETECTORS:")
+    external_classes = [
+        cls for cls in BaseDetector.__subclasses__()
+        if cls not in _BUILTIN_DETECTOR_CLASSES
+    ]
+    if external_classes:
+        for cls in external_classes:
+            source = getattr(sys.modules.get(cls.__module__), "__file__", "unknown")
+            print(f"  • {cls.__name__:<30} {cls.name}  [{source}]")
+    else:
+        print("  (none loaded)")
+
+    print(f"\nModule path: {module_path if module_path else '(not configured)'}")
+    if _EXTERNAL_MODULE_ERRORS:
+        print("\nMODULE LOAD ERRORS:")
+        for item in _EXTERNAL_MODULE_ERRORS:
+            print(f"  ! {item['file']}: {item['error']}")
 
 
 # ==============================================================================
@@ -1707,7 +1890,14 @@ USAGE PATTERNS:
      Python ctypes. A future native collector can emit the same JSONL event
      protocol without changing cmdtrace's reporting or detector layers.
 
-  8. Dynamic Watch List & Ignore Pattern Management:
+  8. External Detector Modules:
+     sudo cmdtrace set module path /etc/cmdtrace/modules
+     sudo cmdtrace modules
+
+     Built-in detectors in this script are loaded first. Any .py detector
+     modules found in the configured directory are then loaded afterward.
+
+  9. Dynamic Watch List & Ignore Pattern Management:
      sudo cmdtrace watch list
      sudo cmdtrace watch add /etc/nginx
      sudo cmdtrace watch remove /var/www
@@ -1738,6 +1928,8 @@ COMMAND REFERENCE:
   watch ignore list         List glob patterns excluded from the filesystem watcher
   watch ignore add <glob>   Add an exclusion glob pattern (e.g. "*.log", "*/tmp/*")
   watch ignore remove <glob> Remove an exclusion glob pattern
+  set module path <path>    Set the external detector module directory
+  modules                   List built-in and loaded external detector modules
   help                      Display this detailed user manual
 
 REGISTERED DETECTOR MODULES ({len(detectors)} MODULES ACTIVE):
@@ -1752,6 +1944,7 @@ IGNORED PATTERNS ({len(current_ignores)} PATTERNS ACTIVE):
   Saved baselines:   {BASELINE_DIR}
   History log:       root: {HISTORY_LOG_FILE} / non-root user: {USER_LOG_FILE}
   Event collector:   {load_config().get("event_collector", DEFAULT_EVENT_COLLECTOR)}
+  Module path:       {load_module_path() if load_module_path() else '(not configured)'}
 ================================================================================
 """
     print(help_text)
@@ -1780,7 +1973,7 @@ def build_report(meta_start: dict, start_subsystems: dict, meta_stop: dict, stop
         print(f"Trace Duration: {duration}\n")
 
         for d in detectors:
-            key = d.__class__.__name__
+            key = d.detector_key()
             d_start = start_subsystems.get(key, {})
             d_stop = stop_subsystems.get(key, {})
 
@@ -2038,6 +2231,15 @@ def main():
     ig_rm = ignore_subparsers.add_parser("remove", help="Remove a glob pattern from the ignore list")
     ig_rm.add_argument("pattern", help="Glob pattern to remove")
 
+    set_parser = subparsers.add_parser("set", help="Set persistent cmdtrace configuration")
+    set_subparsers = set_parser.add_subparsers(dest="set_command", required=False)
+    set_module_parser = set_subparsers.add_parser("module", help="Configure external detector modules")
+    set_module_subparsers = set_module_parser.add_subparsers(dest="module_command", required=False)
+    set_module_path_parser = set_module_subparsers.add_parser("path", help="Set the external detector module directory")
+    set_module_path_parser.add_argument("path", help="Directory containing external cmdtrace detector .py modules")
+
+    subparsers.add_parser("modules", help="List built-in and loaded external detector modules")
+
     # Internal command used by start to keep the monitor alive after start exits.
     collector_parser = subparsers.add_parser("_collector", help=argparse.SUPPRESS)
     collector_parser.add_argument("--backend", choices=["python-inotify"], required=True)
@@ -2046,7 +2248,14 @@ def main():
 
     args = parser.parse_args()
 
-    if args.command == "_collector":
+    if args.command == "set":
+        if args.set_command == "module" and args.module_command == "path":
+            cmd_set_module_path(args.path)
+        else:
+            parser.error("usage: cmdtrace set module path <directory>")
+    elif args.command == "modules":
+        cmd_modules_list()
+    elif args.command == "_collector":
         if args.backend == "python-inotify":
             sys.exit(_run_inotify_collector(Path(args.event_file)))
         print(f"Unsupported collector backend: {args.backend}", file=sys.stderr)
