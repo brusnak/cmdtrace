@@ -109,15 +109,15 @@ No third-party Python packages are required.
 Clone the repository and make the script executable:
 
 ```bash
-git clone https://github.com/<your-user>/cmdtrace.git
+git clone https://github.com/brusnak/cmdtrace.git
 cd cmdtrace
-chmod +x cmdtrace.py
+chmod +x cmdtrace
 ```
 
 Optionally place it somewhere in your `PATH`:
 
 ```bash
-sudo cp cmdtrace.py /usr/local/bin/cmdtrace
+sudo cp cmdtrace /usr/local/bin/cmdtrace
 sudo chmod +x /usr/local/bin/cmdtrace
 ```
 
