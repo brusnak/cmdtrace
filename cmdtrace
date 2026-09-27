@@ -1022,41 +1022,83 @@ class NetworkIdentityDetector(BaseDetector):
 
 class PackageDetector(BaseDetector):
     name = "Software Packages"
-    description = "Tracks installed package inventory via dpkg or rpm"
+    description = "Tracks installed, removed, and updated software packages via dpkg or rpm"
 
     def collect(self) -> dict:
         packages = {}
+
+        # 1. Debian / Ubuntu (dpkg / apt)
         if Path("/usr/bin/dpkg-query").exists():
-            out = run_cmd(["dpkg-query", "-W", "-f=${Package}\t${Version}\n"])
+            # Query format: Package:Arch <tab> Version <tab> Status
+            out = run_cmd(["dpkg-query", "-W", "-f=${Package}:${Architecture}\t${Version}\t${db:Status-Status}\n"])
             for line in out.splitlines():
-                if "\t" in line:
-                    pkg, ver = line.split("\t", 1)
-                    packages[pkg] = ver
+                parts = line.split("\t")
+                if len(parts) == 3 and parts[2] == "installed":
+                    pkg_key, ver = parts[0], parts[1]
+                    packages[pkg_key] = ver
+
+        # 2. RHEL / Fedora / CentOS / Rocky (rpm / dnf)
         elif Path("/usr/bin/rpm").exists():
-            out = run_cmd(["rpm", "-qa", "--qf", "%{NAME}\t%{VERSION}-%{RELEASE}\n"])
+            # Query format: Name.Arch <tab> Epoch:Version-Release
+            out = run_cmd(["rpm", "-qa", "--qf", "%{NAME}.%{ARCH}\t%{EPOCHNUM}:%{VERSION}-%{RELEASE}\n"])
             for line in out.splitlines():
                 if "\t" in line:
-                    pkg, ver = line.split("\t", 1)
-                    packages[pkg] = ver
+                    pkg_key, ver = line.split("\t", 1)
+                    # Clean up zero epoch prefixes for readability (e.g., "0:1.2" -> "1.2")
+                    if ver.startswith("0:"):
+                        ver = ver[2:]
+                    packages[pkg_key] = ver
+
         return packages
 
     def diff(self, start: dict, stop: dict, meta_start: dict, meta_stop: dict) -> dict:
+        added = {}
+        removed = {}
+        updated = {}
+
+        all_keys = set(start.keys()) | set(stop.keys())
+
+        for key in all_keys:
+            in_start = key in start
+            in_stop = key in stop
+
+            if in_stop and not in_start:
+                added[key] = stop[key]
+            elif in_start and not in_stop:
+                removed[key] = start[key]
+            elif start[key] != stop[key]:
+                updated[key] = {
+                    "old": start[key],
+                    "new": stop[key]
+                }
+
         return {
-            "added": {k: stop[k] for k in stop if k not in start},
-            "removed": {k: start[k] for k in start if k not in stop}
+            "added": added,
+            "removed": removed,
+            "updated": updated
         }
 
     def render(self, diff_data: dict) -> None:
-        if diff_data["added"] or diff_data["removed"]:
+        added = diff_data.get("added", {})
+        removed = diff_data.get("removed", {})
+        updated = diff_data.get("updated", {})
+
+        if added or removed or updated:
             print("PACKAGES & SOFTWARE")
-            for p, v in diff_data["added"].items():
+            for p, v in added.items():
                 print(f"  + Package Installed: {p} ({v})")
-            for p in diff_data["removed"]:
-                print(f"  - Package Uninstalled: {p}")
+            for p, info in updated.items():
+                print(f"  ~ Package Updated:   {p} ({info['old']} → {info['new']})")
+            for p in removed:
+                print(f"  - Package Removed:   {p}")
             print()
 
     def summary_metrics(self, diff_data: dict) -> dict:
-        return {"Packages Installed": len(diff_data.get("added", {}))}
+        return {
+            "Packages Installed": len(diff_data.get("added", {})),
+            "Packages Updated": len(diff_data.get("updated", {})),
+            "Packages Removed": len(diff_data.get("removed", {}))
+        }
 
 
 class ServiceDepsDetector(BaseDetector):
