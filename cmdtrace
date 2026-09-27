@@ -160,19 +160,23 @@ def save_ignore_patterns(patterns: list) -> bool:
 
 
 def redact_env(env: dict) -> dict:
-    """Return a copy of an environment dict with sensitive-looking values redacted."""
-    return {
-        k: ("***REDACTED***" if SENSITIVE_ENV_NAME_PATTERN.search(k) else v)
-        for k, v in env.items()
-    }
-
-
-def mode_has_suid_sgid(mode_str: str) -> bool:
-    """Return True if an octal mode string (e.g. '0o4755') has the setuid or setgid bit set."""
-    try:
-        return bool(int(mode_str, 8) & 0o6000)
-    except Exception:
-        return False
+    """
+    Return a copy of an environment dict with sensitive-looking values
+    replaced by a short SHA-256 fingerprint of the value, rather than a
+    fixed placeholder string. A fixed placeholder ("***REDACTED***") would
+    be identical across two snapshots even if the underlying secret changed,
+    making a rotated key/password invisible to the diff. Fingerprinting
+    keeps the actual value out of the snapshot entirely (SHA-256 is one-way)
+    while still letting two snapshots be compared to detect that it changed.
+    """
+    redacted = {}
+    for k, v in env.items():
+        if SENSITIVE_ENV_NAME_PATTERN.search(k):
+            fingerprint = hashlib.sha256(str(v).encode("utf-8", errors="replace")).hexdigest()[:12]
+            redacted[k] = f"***REDACTED(sha256:{fingerprint})***"
+        else:
+            redacted[k] = v
+    return redacted
 
 
 # ==============================================================================
@@ -197,6 +201,14 @@ def hash_file(path: Path) -> str:
     except Exception:
         pass
     return ""
+
+
+def mode_has_suid_sgid(mode_str: str) -> bool:
+    """Return True if an octal mode string (e.g. '0o4755') has the setuid or setgid bit set."""
+    try:
+        return bool(int(mode_str, 8) & 0o6000)
+    except Exception:
+        return False
 
 
 # ==============================================================================
@@ -757,46 +769,45 @@ class UsersAuthDetector(BaseDetector):
         }
 
     def diff(self, start: dict, stop: dict, meta_start: dict, meta_stop: dict) -> dict:
-        u_a, u_b = start.get("users", {}), stop.get("users", {})
-        g_a, g_b = start.get("groups", {}), stop.get("groups", {})
+        env_a, env_b = start.get("env_vars", {}), stop.get("env_vars", {})
 
-        pam_a, pam_b = start.get("pam_hashes", {}), stop.get("pam_hashes", {})
-        pam_changed_files = sorted(
-            f for f in set(pam_a) | set(pam_b) if pam_a.get(f) != pam_b.get(f)
-        )
+        # Only ever compare the redacted (fingerprinted) values below —
+        # actual secret values are never present in a collected snapshot.
+        sensitive_a = {k for k in env_a if SENSITIVE_ENV_NAME_PATTERN.search(k)}
+        sensitive_b = {k for k in env_b if SENSITIVE_ENV_NAME_PATTERN.search(k)}
 
         return {
-            "users_added": [u for u in u_b if u not in u_a],
-            "users_removed": [u for u in u_a if u not in u_b],
-            "groups_added": [g for g in g_b if g not in g_a],
-            "groups_removed": [g for g in g_a if g not in g_b],
-            "sudoers_changed": start.get("sudoers_hash") != stop.get("sudoers_hash"),
-            "sshd_changed": start.get("sshd_hash") != stop.get("sshd_hash"),
-            "shadow_changed": start.get("shadow_hash") != stop.get("shadow_hash"),
-            "pam_changed_files": pam_changed_files
+            "path_changed": start.get("path") != stop.get("path"),
+            "profiles_changed": start.get("profile_hashes") != stop.get("profile_hashes"),
+            "sensitive_vars_added": sorted(sensitive_b - sensitive_a),
+            "sensitive_vars_removed": sorted(sensitive_a - sensitive_b),
+            "sensitive_vars_changed": sorted(
+                k for k in sensitive_a & sensitive_b if env_a.get(k) != env_b.get(k)
+            )
         }
 
     def render(self, diff_data: dict) -> None:
-        if any(diff_data.values()):
-            print("USER, GROUP & SECURITY CONFIGURATION")
-            for u in diff_data["users_added"]:
-                print(f"  + User created: {u}")
-            for u in diff_data["users_removed"]:
-                print(f"  - User deleted: {u}")
-            if diff_data["sudoers_changed"]:
-                print("  ! ALERT: /etc/sudoers file was modified")
-            if diff_data["sshd_changed"]:
-                print("  ! ALERT: /etc/ssh/sshd_config file was modified")
-            if diff_data["shadow_changed"]:
-                print("  ! ALERT: /etc/shadow file was modified")
-            if diff_data["pam_changed_files"]:
-                print(f"  ! ALERT: PAM configuration modified ({len(diff_data['pam_changed_files'])} file(s))")
-                for f in diff_data["pam_changed_files"][:5]:
-                    print(f"      - {f}")
+        if (diff_data["path_changed"] or diff_data["profiles_changed"]
+                or diff_data["sensitive_vars_added"] or diff_data["sensitive_vars_removed"]
+                or diff_data["sensitive_vars_changed"]):
+            print("ENVIRONMENT CONFIGURATION")
+            if diff_data["path_changed"]:
+                print("  ~ Environment PATH variable modified")
+            if diff_data["profiles_changed"]:
+                print("  ~ System/User shell profile scripts modified")
+            for v in diff_data["sensitive_vars_changed"]:
+                print(f"  ! ALERT: Sensitive environment variable value changed: {v}")
+            for v in diff_data["sensitive_vars_added"]:
+                print(f"  ! ALERT: New sensitive environment variable set: {v}")
+            for v in diff_data["sensitive_vars_removed"]:
+                print(f"  ! ALERT: Sensitive environment variable removed: {v}")
             print()
 
     def summary_metrics(self, diff_data: dict) -> dict:
-        return {"Users Created": len(diff_data.get("users_added", []))}
+        total = (len(diff_data.get("sensitive_vars_added", []))
+                 + len(diff_data.get("sensitive_vars_removed", []))
+                 + len(diff_data.get("sensitive_vars_changed", [])))
+        return {"Sensitive Env Var Changes": total}
 
 
 class KernelHardwareDetector(BaseDetector):
