@@ -1708,7 +1708,7 @@ IGNORED PATTERNS ({len(current_ignores)} PATTERNS ACTIVE):
   {', '.join(current_ignores)}
   Persistent config: {CONFIG_FILE}
   Saved baselines:   {BASELINE_DIR}
-  History log:       {HISTORY_LOG_FILE}
+  History log:       root: {HISTORY_LOG_FILE} / non-root user: {USER_LOG_FILE}
   Event collector:   {load_config().get("event_collector", DEFAULT_EVENT_COLLECTOR)}
 ================================================================================
 """

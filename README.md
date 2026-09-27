@@ -417,8 +417,6 @@ For example, a deployment script might be expected to make certain changes. If i
 
 The filesystem event timeline provides additional visibility into activity that occurred during the session, including intermediate events such as create, permission changes, writes, and deletes. That timeline is primarily for investigation and reporting; it is separate from the `--fail-on-change` exit-code gate.
 
-If real-time enforcement is needed in the future, that would be a separate feature with different semantics, such as configurable rules for which events should cause an operation to be terminated.
-
 ### `--fail-on-change` with other commands
 
 The option is available anywhere cmdtrace performs a change comparison:
@@ -615,7 +613,7 @@ PRIVATE
 have their values replaced with:
 
 ```text
-***REDACTED***
+***REDACTED***(SHA-256 Hash)
 ```
 
 This is name-based redaction, not a guarantee that every possible secret format will be detected.
