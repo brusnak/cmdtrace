@@ -1,0 +1,1892 @@
+#!/usr/bin/env python3
+#
+# Bret Rusnak
+# September 2026
+#
+#  cmdtrace — Linux System Change Tracking and Troubleshooting Tool
+#
+#  Captures comprehensive system state across 14 subsystems before and after an operation:
+#  - Users, Groups & Auth (Passwd, Sudoers, SSH Keys)
+#  - Kernel & Hardware (Modules, Block Devices, Mounts)
+#  - Execution Environment (Environment vars, Shell profiles, PATH)
+#  - Scheduled Jobs (Cron, Systemd Timers)
+#  - Firewalls (nftables, iptables, ufw, firewalld)
+#  - Storage & Swap (LVM, Filesystems, Swaps, Mounts)
+#  - Containers (Docker & Podman containers/images)
+#  - Network Identity & Routing (IPs, Routes, Hosts, Resolv.conf)
+#  - System Logs (Journalctl activity during tracing period)
+#  - Processes & Open Files (PPID, User, FDs, Memory, Sockets)
+#  - Systemd Dependency Trees
+#  - Command Execution Wrapper (`cmdtrace run -- <cmd>`)
+#  - Integrated Help & Usage Guide (`cmdtrace help`)
+#
+# ==============================================================================
+
+
+import os
+import sys
+import json
+import time
+import re
+import glob
+import fnmatch
+import argparse
+import subprocess
+import hashlib
+import io
+import syslog
+import contextlib
+import concurrent.futures
+import ctypes
+import errno
+import signal
+import struct
+from abc import ABC, abstractmethod
+from pathlib import Path
+from datetime import datetime, timedelta
+
+# ==============================================================================
+# GLOBAL CONFIGURATION & PERSISTENT WATCH STORE
+# ==============================================================================
+
+SNAPSHOT_FILE = Path("/var/tmp/cmdtrace_snapshot.json")
+CONFIG_FILE = Path("/etc/cmdtrace_config.json")
+BASELINE_DIR = Path("/var/lib/cmdtrace/baselines")
+HISTORY_LOG_FILE = Path("/var/log/cmdtrace/history.log")
+
+DEFAULT_WATCH_DIRS = [
+    "/etc",
+    "/usr/local/bin",
+    "/usr/local/sbin",
+    "/usr/local/etc",
+    "/opt",
+    "/root",
+    "/boot",
+    "/usr/lib/systemd/system",
+    "/var/www"
+]
+
+# Glob-style patterns (matched against the full path and against the bare
+# filename) that the Filesystem Integrity Watcher skips over. Keeps expected,
+# high-churn noise (VCS internals, caches, logs) out of every report.
+DEFAULT_IGNORE_PATTERNS = [
+    "*.log",
+    "*.tmp",
+    "*.swp",
+    "*/.git/*",
+    "*/__pycache__/*",
+    "*/node_modules/*",
+]
+
+# Environment variable NAMES matching this pattern have their VALUE redacted
+# before ever being written to a snapshot, report, or export file.
+SENSITIVE_ENV_NAME_PATTERN = re.compile(
+    r"(KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTH|PRIVATE)", re.IGNORECASE
+)
+
+HASH_MAX_SIZE_BYTES = 1024 * 512  # 512 KB threshold for full SHA256 hashing
+
+FS_EVENT_DIR = Path("/var/tmp")
+INOTIFY_EVENT_STRUCT = struct.Struct("iIII")
+IN_CREATE = 0x00000100
+IN_DELETE = 0x00000200
+IN_ATTRIB = 0x00000004
+IN_CLOSE_WRITE = 0x00000008
+IN_MOVED_FROM = 0x00000040
+IN_MOVED_TO = 0x00000080
+IN_DELETE_SELF = 0x00000400
+IN_MOVE_SELF = 0x00000800
+IN_ISDIR = 0x40000000
+IN_IGNORED = 0x00008000
+IN_Q_OVERFLOW = 0x00004000
+IN_NONBLOCK = 0x00000800
+
+
+def load_config() -> dict:
+    """Load the full persistent config (watch dirs + ignore patterns), falling back to defaults."""
+    if CONFIG_FILE.exists():
+        try:
+            with open(CONFIG_FILE, "r") as f:
+                data = json.load(f)
+            data.setdefault("watch_dirs", list(DEFAULT_WATCH_DIRS))
+            data.setdefault("ignore_patterns", list(DEFAULT_IGNORE_PATTERNS))
+            return data
+        except Exception:
+            pass
+    return {"watch_dirs": list(DEFAULT_WATCH_DIRS), "ignore_patterns": list(DEFAULT_IGNORE_PATTERNS)}
+
+
+def save_config(data: dict) -> bool:
+    """Persist the full config dict to disk."""
+    try:
+        CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(CONFIG_FILE, "w") as f:
+            json.dump(data, f, indent=2)
+        return True
+    except Exception as e:
+        print(f"Error saving configuration: {e}", file=sys.stderr)
+        return False
+
+
+def load_watch_dirs() -> list:
+    """Load persistent watch directories from config file, falling back to defaults."""
+    return sorted(set(load_config().get("watch_dirs", DEFAULT_WATCH_DIRS)))
+
+
+def save_watch_dirs(dirs: list) -> bool:
+    """Save watch directory list persistently to disk."""
+    cfg = load_config()
+    cfg["watch_dirs"] = sorted(set(dirs))
+    return save_config(cfg)
+
+
+def load_ignore_patterns() -> list:
+    """Load persistent filesystem-watcher ignore patterns, falling back to defaults."""
+    return sorted(set(load_config().get("ignore_patterns", DEFAULT_IGNORE_PATTERNS)))
+
+
+def save_ignore_patterns(patterns: list) -> bool:
+    """Save the ignore-pattern list persistently to disk."""
+    cfg = load_config()
+    cfg["ignore_patterns"] = sorted(set(patterns))
+    return save_config(cfg)
+
+
+def redact_env(env: dict) -> dict:
+    """Return a copy of an environment dict with sensitive-looking values redacted."""
+    return {
+        k: ("***REDACTED***" if SENSITIVE_ENV_NAME_PATTERN.search(k) else v)
+        for k, v in env.items()
+    }
+
+
+def mode_has_suid_sgid(mode_str: str) -> bool:
+    """Return True if an octal mode string (e.g. '0o4755') has the setuid or setgid bit set."""
+    try:
+        return bool(int(mode_str, 8) & 0o6000)
+    except Exception:
+        return False
+
+
+# ==============================================================================
+# SHARED UTILITY FUNCTIONS
+# ==============================================================================
+
+def run_cmd(cmd: list) -> str:
+    """Execute system command safely and return stdout string."""
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+        return res.stdout.strip() if res.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
+def hash_file(path: Path) -> str:
+    """Generate SHA256 hash for a given file path."""
+    try:
+        if path.is_file() and path.stat().st_size <= HASH_MAX_SIZE_BYTES:
+            with open(path, "rb") as f:
+                return hashlib.sha256(f.read()).hexdigest()
+    except Exception:
+        pass
+    return ""
+
+
+# ==============================================================================
+# FILESYSTEM EVENT TIMELINE
+# ==============================================================================
+
+def get_event_file(session: str) -> Path:
+    safe = re.sub(r'[^A-Za-z0-9_.-]', '_', session)
+    return FS_EVENT_DIR / f"cmdtrace_events_{safe}.jsonl"
+
+def _fs_event_state(path: str) -> dict:
+    try:
+        st = os.stat(path)
+        return {"mode": oct(st.st_mode & 0o7777), "uid": st.st_uid, "gid": st.st_gid, "size": st.st_size}
+    except (FileNotFoundError, PermissionError, OSError):
+        return {}
+
+def _fs_event_ignored(path: str, name: str, patterns: list) -> bool:
+    return any(fnmatch.fnmatch(path, pat) or fnmatch.fnmatch(name, pat) for pat in patterns)
+
+def _inotify_init():
+    libc = ctypes.CDLL(None, use_errno=True)
+    init1 = getattr(libc, "inotify_init1", None)
+    if init1 is not None:
+        init1.argtypes = [ctypes.c_int]
+        init1.restype = ctypes.c_int
+        fd = init1(IN_NONBLOCK)
+    else:
+        init = libc.inotify_init
+        init.argtypes = []
+        init.restype = ctypes.c_int
+        fd = init()
+        if fd >= 0:
+            os.set_blocking(fd, False)
+    if fd < 0:
+        err = ctypes.get_errno()
+        raise OSError(err, os.strerror(err))
+    return libc, fd
+
+def _inotify_add_watch(libc, fd: int, path: str) -> int:
+    add_watch = libc.inotify_add_watch
+    add_watch.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32]
+    add_watch.restype = ctypes.c_int
+    mask = IN_CREATE | IN_DELETE | IN_ATTRIB | IN_CLOSE_WRITE | IN_MOVED_FROM | IN_MOVED_TO | IN_DELETE_SELF | IN_MOVE_SELF
+    wd = add_watch(fd, os.fsencode(path), mask)
+    if wd < 0:
+        err = ctypes.get_errno()
+        raise OSError(err, os.strerror(err))
+    return wd
+
+def _inotify_remove_watch(libc, fd: int, wd: int) -> None:
+    try:
+        rm_watch = libc.inotify_rm_watch
+        rm_watch.argtypes = [ctypes.c_int, ctypes.c_int]
+        rm_watch.restype = ctypes.c_int
+        rm_watch(fd, wd)
+    except Exception:
+        pass
+
+def _write_fs_event(fp, event: dict) -> None:
+    fp.write(json.dumps(event, separators=(",", ":")) + "\n")
+    fp.flush()
+
+def _run_filesystem_monitor(event_file: Path) -> int:
+    stop_requested = False
+    def request_stop(signum, frame):
+        nonlocal stop_requested
+        stop_requested = True
+    signal.signal(signal.SIGTERM, request_stop)
+    signal.signal(signal.SIGINT, request_stop)
+
+    event_file.parent.mkdir(parents=True, exist_ok=True)
+    watch_dirs = load_watch_dirs()
+    ignore_patterns = load_ignore_patterns()
+    try:
+        libc, fd = _inotify_init()
+    except Exception as e:
+        print(f"Filesystem event monitor unavailable: {e}", file=sys.stderr)
+        return 1
+
+    watches, pending_moves, state_cache = {}, {}, {}
+    try:
+        with open(event_file, "a", buffering=1) as out:
+            for target in watch_dirs:
+                if not os.path.isdir(target):
+                    continue
+                for root, dirs, _ in os.walk(target):
+                    if _fs_event_ignored(root, os.path.basename(root), ignore_patterns):
+                        dirs[:] = []
+                        continue
+                    try:
+                        wd = _inotify_add_watch(libc, fd, root)
+                        watches[wd] = root
+                    except OSError:
+                        continue
+            _write_fs_event(out, {"timestamp": time.time(), "event": "MONITOR_STARTED", "path": None})
+
+            while not stop_requested:
+                try:
+                    data = os.read(fd, 1024 * 64)
+                except BlockingIOError:
+                    time.sleep(0.10)
+                    continue
+                except OSError as e:
+                    if e.errno == errno.EINTR:
+                        continue
+                    break
+                offset = 0
+                while offset + INOTIFY_EVENT_STRUCT.size <= len(data):
+                    wd, mask, cookie, name_len = INOTIFY_EVENT_STRUCT.unpack_from(data, offset)
+                    offset += INOTIFY_EVENT_STRUCT.size
+                    raw_name = data[offset:offset + name_len]
+                    offset += name_len
+                    name = raw_name.split(b"\0", 1)[0].decode(errors="replace")
+                    if mask & IN_Q_OVERFLOW:
+                        _write_fs_event(out, {"timestamp": time.time(), "event": "QUEUE_OVERFLOW", "path": None, "warning": "inotify queue overflow; some filesystem events may be missing"})
+                        continue
+                    parent = watches.get(wd)
+                    if not parent:
+                        continue
+                    path = os.path.join(parent, name) if name else parent
+                    if _fs_event_ignored(path, name, ignore_patterns):
+                        continue
+                    is_dir = bool(mask & IN_ISDIR)
+                    state_now = _fs_event_state(path) if not (mask & IN_DELETE) else {}
+                    previous = state_cache.get(path, {})
+
+                    if (mask & (IN_CREATE | IN_MOVED_TO)) and is_dir and os.path.isdir(path):
+                        try:
+                            new_wd = _inotify_add_watch(libc, fd, path)
+                            watches[new_wd] = path
+                        except OSError:
+                            pass
+
+                    emitted = []
+                    if mask & IN_CREATE:
+                        emitted.append(("CREATED", {"state": state_now}))
+                        state_cache[path] = state_now
+
+                    if mask & IN_DELETE:
+                        emitted.append(("DELETED", {}))
+                        state_cache.pop(path, None)
+
+                    if mask & IN_MOVED_FROM:
+                        pending_moves[cookie] = {"path": path, "state": previous}
+                        emitted.append(("MOVED_FROM", {}))
+                        state_cache.pop(path, None)
+
+                    if mask & IN_MOVED_TO:
+                        details = {"state": state_now}
+                        moved = pending_moves.pop(cookie, None)
+                        if moved:
+                            details["from"] = moved["path"]
+                            details["state_before"] = moved.get("state", {})
+                        emitted.append(("MOVED_TO", details))
+                        state_cache[path] = state_now
+
+                    if mask & IN_ATTRIB:
+                        changes = {}
+                        if previous and state_now:
+                            for field in ("mode", "uid", "gid"):
+                                if previous.get(field) != state_now.get(field):
+                                    changes[field] = {"before": previous.get(field), "after": state_now.get(field)}
+                        metadata_event = "METADATA_CHANGED"
+                        if "mode" in changes:
+                            metadata_event = "PERMISSIONS_CHANGED"
+                        elif "uid" in changes or "gid" in changes:
+                            metadata_event = "OWNERSHIP_CHANGED"
+                        emitted.append((metadata_event, {"changes": changes, "state": state_now}))
+                        state_cache[path] = state_now
+
+                    if mask & IN_CLOSE_WRITE:
+                        emitted.append(("CONTENT_WRITE", {"state": state_now}))
+                        state_cache[path] = state_now
+
+                    for event_name, details in emitted:
+                        _write_fs_event(out, {"timestamp": time.time(), "event": event_name, "path": path, "is_dir": is_dir, "cookie": cookie, **details})
+
+                    if mask & (IN_DELETE_SELF | IN_MOVE_SELF | IN_IGNORED):
+                        watches.pop(wd, None)
+    finally:
+        for wd in list(watches):
+            _inotify_remove_watch(libc, fd, wd)
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+    return 0
+
+def start_filesystem_monitor(session: str) -> dict:
+    event_file = get_event_file(session)
+    try:
+        event_file.unlink()
+    except FileNotFoundError:
+        pass
+    script_path = str(Path(__file__).resolve())
+    cmd = [sys.executable, script_path, "_fswatch", "--event-file", str(event_file)]
+    try:
+        with open(os.devnull, "w") as devnull:
+            proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=devnull, stderr=devnull, start_new_session=True, close_fds=True)
+
+        # Do not let `cmdtrace start` return until the monitor has initialized
+        # and written its readiness marker. This closes the startup race where
+        # a user could create/change a file immediately after `start`.
+        ready_deadline = time.time() + 2.0
+        ready = False
+        while time.time() < ready_deadline:
+            if proc.poll() is not None:
+                break
+            try:
+                if event_file.exists():
+                    with open(event_file, "r") as f:
+                        if any('"event":"MONITOR_STARTED"' in line for line in f):
+                            ready = True
+                            break
+            except OSError:
+                pass
+            time.sleep(0.05)
+
+        if not ready:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+            raise RuntimeError("filesystem event monitor did not become ready")
+
+        return {"pid": proc.pid, "event_file": str(event_file)}
+    except Exception as e:
+        print(f"Warning: could not start filesystem event monitor: {e}", file=sys.stderr)
+        return {}
+
+def stop_filesystem_monitor(meta: dict) -> list:
+    monitor = meta.get("filesystem_monitor", {})
+    pid = monitor.get("pid")
+    event_file = Path(monitor.get("event_file", "")) if monitor.get("event_file") else None
+    if pid:
+        try:
+            os.kill(int(pid), signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        except Exception as e:
+            print(f"Warning: could not stop filesystem monitor PID {pid}: {e}", file=sys.stderr)
+        deadline = time.time() + 3.0
+        while time.time() < deadline:
+            try:
+                os.kill(int(pid), 0)
+                time.sleep(0.05)
+            except (ProcessLookupError, PermissionError):
+                break
+            except Exception:
+                break
+    events = []
+    if event_file and event_file.exists():
+        try:
+            with open(event_file, "r") as f:
+                for line in f:
+                    try:
+                        event = json.loads(line)
+                        if event.get("event") != "MONITOR_STARTED":
+                            events.append(event)
+                    except json.JSONDecodeError:
+                        continue
+        except Exception as e:
+            print(f"Warning: could not read filesystem event log: {e}", file=sys.stderr)
+        try:
+            event_file.unlink()
+        except Exception:
+            pass
+    return events
+
+def render_filesystem_activity(events: list) -> None:
+    if not events:
+        return
+    print("FILESYSTEM ACTIVITY TIMELINE")
+    for event in events[:200]:
+        ts = datetime.fromtimestamp(event.get("timestamp", time.time())).strftime("%H:%M:%S")
+        kind = event.get("event", "UNKNOWN")
+        path = event.get("path") or "—"
+        if kind in ("METADATA_CHANGED", "PERMISSIONS_CHANGED", "OWNERSHIP_CHANGED"):
+            changes = event.get("changes", {})
+            if changes.get("mode"):
+                detail = f"mode {changes['mode']['before']} → {changes['mode']['after']}"
+            elif changes.get("uid") or changes.get("gid"):
+                detail = ", ".join(f"{field} {change['before']} → {change['after']}" for field, change in changes.items())
+            else:
+                detail = "metadata/attributes changed"
+        elif kind == "MOVED_TO" and event.get("from"):
+            detail = f"from {event['from']}"
+        elif kind == "CREATED":
+            state = event.get("state", {})
+            detail = f"mode={state.get('mode', '?')} uid={state.get('uid', '?')} gid={state.get('gid', '?')}"
+        else:
+            detail = ""
+        suffix = f" — {detail}" if detail else ""
+        print(f"  {ts}  {kind:<18} {path}{suffix}")
+    if len(events) > 200:
+        print(f"  ... and {len(events) - 200} additional filesystem events")
+    print()
+
+def filesystem_activity_metrics(events: list) -> dict:
+    return {"Filesystem Events": len(events)}
+
+# ==============================================================================
+# ABSTRACT BASE DETECTOR (MODULAR INTERFACE)
+# ==============================================================================
+
+class BaseDetector(ABC):
+    """
+    Abstract Base Class for all cmdtrace subsystem monitors.
+    Subclasses automatically register with the engine upon definition.
+    """
+    name: str = "Base Detector"
+    description: str = "Base detector description"
+
+    @abstractmethod
+    def collect(self) -> dict:
+        """Capture live system state into a JSON-serializable dictionary."""
+        pass
+
+    @abstractmethod
+    def diff(self, start_data: dict, stop_data: dict, meta_start: dict, meta_stop: dict) -> dict:
+        """Compute differences between baseline and ending state."""
+        pass
+
+    @abstractmethod
+    def render(self, diff_data: dict) -> None:
+        """Print human-readable change details to stdout if modifications exist."""
+        pass
+
+    def summary_metrics(self, diff_data: dict) -> dict:
+        """Return key-value pair metrics to be printed in the final summary box."""
+        return {}
+
+    def has_changes(self, diff_data: dict) -> bool:
+        """
+        Return True if this detector's diff indicates an actual system change.
+        Used by --fail-on-change. Default: any truthy value in the diff dict
+        counts as a change. Override for detectors whose diff is purely
+        informational (e.g. journal log excerpts) and shouldn't trip it.
+        """
+        if isinstance(diff_data, dict):
+            return any(bool(v) for v in diff_data.values())
+        return bool(diff_data)
+
+    def get_help_text(self) -> str:
+        """Return formatted string entry for 'cmdtrace help'."""
+        return f"  • {self.name:<28} {self.description}"
+
+
+def get_all_detectors() -> list:
+    """Instantiate and return all detector classes registered via BaseDetector subclasses."""
+    return [cls() for cls in BaseDetector.__subclasses__()]
+
+
+def collect_all(detectors: list) -> dict:
+    """Run every detector's collect() concurrently and return {ClassName: data}."""
+    results = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(len(detectors), 1)) as executor:
+        future_map = {executor.submit(d.collect): d.__class__.__name__ for d in detectors}
+        for future in concurrent.futures.as_completed(future_map):
+            name = future_map[future]
+            try:
+                results[name] = future.result()
+            except Exception as e:
+                print(f"Warning: detector '{name}' failed to collect: {e}", file=sys.stderr)
+                results[name] = {}
+    return results
+
+
+# ==============================================================================
+# SUBSYSTEM DETECTOR MODULES
+# ==============================================================================
+
+class UsersAuthDetector(BaseDetector):
+    name = "Users, Groups & Auth"
+    description = "Tracks /etc/passwd, /etc/group, sudoers, SSH keys, and sshd_config"
+
+    def collect(self) -> dict:
+        users, groups, ssh_keys = {}, {}, {}
+        if Path("/etc/passwd").exists():
+            try:
+                with open("/etc/passwd", "r") as f:
+                    for line in f:
+                        p = line.strip().split(":")
+                        if len(p) >= 7:
+                            users[p[0]] = {"uid": p[2], "gid": p[3], "home": p[5], "shell": p[6]}
+            except Exception:
+                pass
+
+        if Path("/etc/group").exists():
+            try:
+                with open("/etc/group", "r") as f:
+                    for line in f:
+                        p = line.strip().split(":")
+                        if len(p) >= 4:
+                            groups[p[0]] = {"gid": p[2], "members": p[3].split(",") if p[3] else []}
+            except Exception:
+                pass
+
+        for user, data in users.items():
+            auth_file = Path(data["home"]) / ".ssh" / "authorized_keys"
+            if auth_file.exists():
+                ssh_keys[user] = hash_file(auth_file)
+
+        pam_hashes = {}
+        pam_dir = Path("/etc/pam.d")
+        if pam_dir.is_dir():
+            try:
+                for f in sorted(pam_dir.glob("*")):
+                    if f.is_file():
+                        pam_hashes[str(f)] = hash_file(f)
+            except Exception:
+                pass
+
+        return {
+            "users": users,
+            "groups": groups,
+            "ssh_keys": ssh_keys,
+            "sudoers_hash": hash_file(Path("/etc/sudoers")),
+            "sshd_hash": hash_file(Path("/etc/ssh/sshd_config")),
+            "shadow_hash": hash_file(Path("/etc/shadow")),
+            "pam_hashes": pam_hashes
+        }
+
+    def diff(self, start: dict, stop: dict, meta_start: dict, meta_stop: dict) -> dict:
+        u_a, u_b = start.get("users", {}), stop.get("users", {})
+        g_a, g_b = start.get("groups", {}), stop.get("groups", {})
+
+        pam_a, pam_b = start.get("pam_hashes", {}), stop.get("pam_hashes", {})
+        pam_changed_files = sorted(
+            f for f in set(pam_a) | set(pam_b) if pam_a.get(f) != pam_b.get(f)
+        )
+
+        return {
+            "users_added": [u for u in u_b if u not in u_a],
+            "users_removed": [u for u in u_a if u not in u_b],
+            "groups_added": [g for g in g_b if g not in g_a],
+            "groups_removed": [g for g in g_a if g not in g_b],
+            "sudoers_changed": start.get("sudoers_hash") != stop.get("sudoers_hash"),
+            "sshd_changed": start.get("sshd_hash") != stop.get("sshd_hash"),
+            "shadow_changed": start.get("shadow_hash") != stop.get("shadow_hash"),
+            "pam_changed_files": pam_changed_files
+        }
+
+    def render(self, diff_data: dict) -> None:
+        if any(diff_data.values()):
+            print("USER, GROUP & SECURITY CONFIGURATION")
+            for u in diff_data["users_added"]:
+                print(f"  + User created: {u}")
+            for u in diff_data["users_removed"]:
+                print(f"  - User deleted: {u}")
+            if diff_data["sudoers_changed"]:
+                print("  ! ALERT: /etc/sudoers file was modified")
+            if diff_data["sshd_changed"]:
+                print("  ! ALERT: /etc/ssh/sshd_config file was modified")
+            if diff_data["shadow_changed"]:
+                print("  ! ALERT: /etc/shadow file was modified")
+            if diff_data["pam_changed_files"]:
+                print(f"  ! ALERT: PAM configuration modified ({len(diff_data['pam_changed_files'])} file(s))")
+                for f in diff_data["pam_changed_files"][:5]:
+                    print(f"      - {f}")
+            print()
+
+    def summary_metrics(self, diff_data: dict) -> dict:
+        return {"Users Created": len(diff_data.get("users_added", []))}
+
+
+class KernelHardwareDetector(BaseDetector):
+    name = "Kernel & Hardware"
+    description = "Tracks loaded kernel modules (lsmod) and block devices (lsblk)"
+
+    def collect(self) -> dict:
+        modules = set()
+        if Path("/proc/modules").exists():
+            try:
+                with open("/proc/modules", "r") as f:
+                    for line in f:
+                        modules.add(line.split()[0])
+            except Exception:
+                pass
+        return {"modules": sorted(list(modules))}
+
+    def diff(self, start: dict, stop: dict, meta_start: dict, meta_stop: dict) -> dict:
+        m_a, m_b = set(start.get("modules", [])), set(stop.get("modules", []))
+        return {"added": list(m_b - m_a), "removed": list(m_a - m_b)}
+
+    def render(self, diff_data: dict) -> None:
+        if diff_data["added"] or diff_data["removed"]:
+            print("KERNEL MODULES")
+            for m in diff_data["added"]:
+                print(f"  + Module Loaded: {m}")
+            for m in diff_data["removed"]:
+                print(f"  - Module Unloaded: {m}")
+            print()
+
+
+class ExecutionEnvDetector(BaseDetector):
+    name = "Execution Environment"
+    description = "Tracks PATH, environment variables, and shell profile hashes"
+
+    def collect(self) -> dict:
+        env_files = ["/etc/profile", "/etc/environment", "/etc/bash.bashrc", str(Path.home() / ".bashrc")]
+        return {
+            "path": os.environ.get("PATH", ""),
+            # Values are redacted by name pattern (KEY/TOKEN/SECRET/PASSWORD/etc.)
+            # before ever being written to a snapshot, report, or export file.
+            "env_vars": redact_env(dict(os.environ)),
+            "profile_hashes": {f: hash_file(Path(f)) for f in env_files if Path(f).exists()}
+        }
+
+    def diff(self, start: dict, stop: dict, meta_start: dict, meta_stop: dict) -> dict:
+        return {
+            "path_changed": start.get("path") != stop.get("path"),
+            "profiles_changed": start.get("profile_hashes") != stop.get("profile_hashes")
+        }
+
+    def render(self, diff_data: dict) -> None:
+        if diff_data["path_changed"] or diff_data["profiles_changed"]:
+            print("ENVIRONMENT CONFIGURATION")
+            if diff_data["path_changed"]:
+                print("  ~ Environment PATH variable modified")
+            if diff_data["profiles_changed"]:
+                print("  ~ System/User shell profile scripts modified")
+            print()
+
+
+class ScheduledJobsDetector(BaseDetector):
+    name = "Scheduled Jobs"
+    description = "Tracks systemd timers and crontab file modifications"
+
+    def collect(self) -> dict:
+        timers = []
+        out = run_cmd(["systemctl", "list-timers", "--no-legend", "--no-pager"])
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) >= 6:
+                timers.append(parts[-2])
+
+        cron_files = glob.glob("/etc/cron*/**", recursive=True) + glob.glob("/var/spool/cron/crontabs/*")
+        return {"timers": sorted(timers), "cron_hashes": {f: hash_file(Path(f)) for f in cron_files if Path(f).is_file()}}
+
+    def diff(self, start: dict, stop: dict, meta_start: dict, meta_stop: dict) -> dict:
+        t_a, t_b = set(start.get("timers", [])), set(stop.get("timers", []))
+        return {
+            "timers_added": list(t_b - t_a),
+            "timers_removed": list(t_a - t_b),
+            "cron_changed": start.get("cron_hashes") != stop.get("cron_hashes")
+        }
+
+    def render(self, diff_data: dict) -> None:
+        if diff_data["timers_added"] or diff_data["timers_removed"] or diff_data["cron_changed"]:
+            print("SCHEDULED JOBS & TIMERS")
+            for t in diff_data["timers_added"]:
+                print(f"  + Systemd Timer Added: {t}")
+            if diff_data["cron_changed"]:
+                print("  ~ Crontab configuration modified")
+            print()
+
+
+class FirewallDetector(BaseDetector):
+    name = "Firewall Rulesets"
+    description = "Tracks rulesets across nftables, iptables, ufw, and firewalld"
+
+    def collect(self) -> dict:
+        return {
+            "nft": run_cmd(["nft", "list", "ruleset"]),
+            "ipt": run_cmd(["iptables-save"]),
+            "ufw": run_cmd(["ufw", "status"]),
+            "fwd": run_cmd(["firewall-cmd", "--list-all"])
+        }
+
+    def diff(self, start: dict, stop: dict, meta_start: dict, meta_stop: dict) -> dict:
+        return {"changed": start != stop}
+
+    def render(self, diff_data: dict) -> None:
+        if diff_data["changed"]:
+            print("FIREWALL CONFIGURATION")
+            print("  ! ALERT: Firewall ruleset modified (nftables/iptables/ufw/firewalld)\n")
+
+
+class StorageDetector(BaseDetector):
+    name = "Storage & Mounts"
+    description = "Tracks mounts, swaps, filesystems (df), and LVM volumes"
+
+    def collect(self) -> dict:
+        mounts = {}
+        if Path("/proc/mounts").exists():
+            try:
+                with open("/proc/mounts", "r") as f:
+                    for line in f:
+                        p = line.split()
+                        if len(p) >= 3:
+                            mounts[p[1]] = {"dev": p[0], "type": p[2]}
+            except Exception:
+                pass
+        return {"mounts": mounts}
+
+    def diff(self, start: dict, stop: dict, meta_start: dict, meta_stop: dict) -> dict:
+        m_a, m_b = start.get("mounts", {}), stop.get("mounts", {})
+        return {
+            "added": {k: m_b[k] for k in m_b if k not in m_a},
+            "removed": {k: m_a[k] for k in m_a if k not in m_b}
+        }
+
+    def render(self, diff_data: dict) -> None:
+        if diff_data["added"] or diff_data["removed"]:
+            print("STORAGE & MOUNTS")
+            for m, info in diff_data["added"].items():
+                print(f"  + Mount Point Added: {m} ({info['dev']} - {info['type']})")
+            for m in diff_data["removed"]:
+                print(f"  - Mount Point Unmounted: {m}")
+            print()
+
+
+class ContainerDetector(BaseDetector):
+    name = "Container Runtimes"
+    description = "Tracks Docker and Podman container states and running images"
+
+    def collect(self) -> dict:
+        containers = {}
+        for engine in ["docker", "podman"]:
+            if run_cmd(["which", engine]):
+                out = run_cmd([engine, "ps", "-a", "--format", "{{.Names}}|{{.Image}}|{{.Status}}"])
+                containers[engine] = out.splitlines()
+        return containers
+
+    def diff(self, start: dict, stop: dict, meta_start: dict, meta_stop: dict) -> dict:
+        res = {}
+        for engine in ["docker", "podman"]:
+            a, b = set(start.get(engine, [])), set(stop.get(engine, []))
+            if a != b:
+                res[engine] = {"added": list(b - a), "removed": list(a - b)}
+        return res
+
+    def render(self, diff_data: dict) -> None:
+        if diff_data:
+            print("CONTAINER RUNTIMES")
+            for engine, changes in diff_data.items():
+                for c in changes["added"]:
+                    print(f"  + [{engine.upper()}] Container created/started: {c}")
+            print()
+
+
+class NetworkIdentityDetector(BaseDetector):
+    name = "Network Identity & Routing"
+    description = "Tracks IP addresses, routing tables, /etc/hosts, and /etc/resolv.conf"
+
+    def collect(self) -> dict:
+        return {
+            "ip_addr": run_cmd(["ip", "-brief", "address"]),
+            "routes": run_cmd(["ip", "route"]),
+            "hosts_hash": hash_file(Path("/etc/hosts")),
+            "resolv_hash": hash_file(Path("/etc/resolv.conf"))
+        }
+
+    def diff(self, start: dict, stop: dict, meta_start: dict, meta_stop: dict) -> dict:
+        return {
+            "ip_changed": start.get("ip_addr") != stop.get("ip_addr"),
+            "routes_changed": start.get("routes") != stop.get("routes"),
+            "hosts_changed": start.get("hosts_hash") != stop.get("hosts_hash"),
+            "resolv_changed": start.get("resolv_hash") != stop.get("resolv_hash")
+        }
+
+    def render(self, diff_data: dict) -> None:
+        if any(diff_data.values()):
+            print("NETWORK IDENTITY")
+            if diff_data["ip_changed"]:
+                print("  ~ IP Address configuration changed")
+            if diff_data["routes_changed"]:
+                print("  ~ Routing table modified")
+            if diff_data["hosts_changed"]:
+                print("  ~ /etc/hosts file modified")
+            if diff_data["resolv_changed"]:
+                print("  ~ /etc/resolv.conf modified")
+            print()
+
+
+class PackageDetector(BaseDetector):
+    name = "Software Packages"
+    description = "Tracks installed package inventory via dpkg or rpm"
+
+    def collect(self) -> dict:
+        packages = {}
+        if Path("/usr/bin/dpkg-query").exists():
+            out = run_cmd(["dpkg-query", "-W", "-f=${Package}\t${Version}\n"])
+            for line in out.splitlines():
+                if "\t" in line:
+                    pkg, ver = line.split("\t", 1)
+                    packages[pkg] = ver
+        elif Path("/usr/bin/rpm").exists():
+            out = run_cmd(["rpm", "-qa", "--qf", "%{NAME}\t%{VERSION}-%{RELEASE}\n"])
+            for line in out.splitlines():
+                if "\t" in line:
+                    pkg, ver = line.split("\t", 1)
+                    packages[pkg] = ver
+        return packages
+
+    def diff(self, start: dict, stop: dict, meta_start: dict, meta_stop: dict) -> dict:
+        return {
+            "added": {k: stop[k] for k in stop if k not in start},
+            "removed": {k: start[k] for k in start if k not in stop}
+        }
+
+    def render(self, diff_data: dict) -> None:
+        if diff_data["added"] or diff_data["removed"]:
+            print("PACKAGES & SOFTWARE")
+            for p, v in diff_data["added"].items():
+                print(f"  + Package Installed: {p} ({v})")
+            for p in diff_data["removed"]:
+                print(f"  - Package Uninstalled: {p}")
+            print()
+
+    def summary_metrics(self, diff_data: dict) -> dict:
+        return {"Packages Installed": len(diff_data.get("added", {}))}
+
+
+class ServiceDepsDetector(BaseDetector):
+    name = "Systemd Services & Deps"
+    description = "Tracks systemd service unit states and dependency trees"
+
+    def collect(self) -> dict:
+        services = {}
+        out = run_cmd(["systemctl", "list-unit-files", "--type=service", "--no-legend", "--no-pager"])
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) >= 2:
+                services[parts[0]] = {"enabled": parts[1], "active": "unknown"}
+
+        out_act = run_cmd(["systemctl", "list-units", "--type=service", "--all", "--no-legend", "--no-pager"])
+        for line in out_act.splitlines():
+            parts = line.split()
+            if len(parts) >= 4 and parts[0] in services:
+                services[parts[0]]["active"] = parts[2]
+
+        return {"services": services}
+
+    def diff(self, start: dict, stop: dict, meta_start: dict, meta_stop: dict) -> dict:
+        srv_a = start.get("services", {})
+        srv_b = stop.get("services", {})
+        added, changed = {}, {}
+
+        for name, info_b in srv_b.items():
+            if name not in srv_a:
+                added[name] = info_b
+            elif srv_a[name] != info_b:
+                changed[name] = {"before": srv_a[name], "after": info_b}
+        return {"added": added, "changed": changed}
+
+    def render(self, diff_data: dict) -> None:
+        if diff_data["added"] or diff_data["changed"]:
+            print("SYSTEMD SERVICES")
+            for s, info in diff_data["added"].items():
+                print(f"  + Service Added: {s} [State: {info['active']}, Enabled: {info['enabled']}]")
+            for s, chg in diff_data["changed"].items():
+                print(f"  ~ Service Changed: {s} ({chg['before']['active']} → {chg['after']['active']})")
+            print()
+
+    def summary_metrics(self, diff_data: dict) -> dict:
+        total_mod = len(diff_data.get("added", {})) + len(diff_data.get("changed", {}))
+        return {"Services Modified": total_mod}
+
+
+class ProcessDetector(BaseDetector):
+    name = "Process Activity"
+    description = "Tracks process lifecycle, PPID, owner, and open file descriptors"
+
+    def collect(self) -> dict:
+        processes = {}
+        out = run_cmd(["ps", "-eo", "pid,ppid,user,comm,args", "--no-headers"])
+        for line in out.splitlines():
+            parts = line.strip().split(None, 4)
+            if len(parts) >= 4:
+                pid, ppid, user, comm = parts[0], parts[1], parts[2], parts[3]
+                fd_count = 0
+                try:
+                    fd_dir = Path(f"/proc/{pid}/fd")
+                    if fd_dir.exists():
+                        fd_count = len(list(fd_dir.iterdir()))
+                except Exception:
+                    pass
+                processes[pid] = {"ppid": ppid, "user": user, "comm": comm, "fds": fd_count}
+        return processes
+
+    def diff(self, start: dict, stop: dict, meta_start: dict, meta_stop: dict) -> dict:
+        comms_a = {v["comm"] for v in start.values()}
+        started = {pid: v for pid, v in stop.items() if pid not in start and v["comm"] not in comms_a}
+        return {"started": started}
+
+    def render(self, diff_data: dict) -> None:
+        if diff_data["started"]:
+            print("PROCESS ACTIVITY")
+            for pid, v in diff_data["started"].items():
+                print(f"  + Process Started: {v['comm']} (PID {pid}, Owner: {v['user']}, Open FDs: {v['fds']})")
+            print()
+
+    def summary_metrics(self, diff_data: dict) -> dict:
+        return {"Processes Started": len(diff_data.get("started", {}))}
+
+
+class SocketDetector(BaseDetector):
+    name = "Network Ports & Sockets"
+    description = "Tracks active TCP/UDP listening ports and bound process names"
+
+    def collect(self) -> dict:
+        listeners = {}
+        out = run_cmd(["ss", "-tulnp"])
+        for line in out.splitlines():
+            if line.startswith("Netid") or not line.strip():
+                continue
+            parts = line.split()
+            if len(parts) >= 5:
+                proto, addr = parts[0].upper(), parts[4]
+                proc_match = re.search(r'users:\(\("([^"]+)"', line)
+                proc_name = proc_match.group(1) if proc_match else "unknown"
+                listeners[f"{proto} {addr}"] = {"proto": proto, "addr": addr, "process": proc_name}
+        return listeners
+
+    def diff(self, start: dict, stop: dict, meta_start: dict, meta_stop: dict) -> dict:
+        return {"added": {k: stop[k] for k in stop if k not in start}}
+
+    def render(self, diff_data: dict) -> None:
+        if diff_data["added"]:
+            print("NETWORK PORTS & SOCKETS")
+            for k, v in diff_data["added"].items():
+                print(f"  + Listening Port: {v['proto']} {v['addr']} → Process: {v['process']}")
+            print()
+
+    def summary_metrics(self, diff_data: dict) -> dict:
+        return {"Ports Opened": len(diff_data.get("added", {}))}
+
+
+class FilesystemDetector(BaseDetector):
+    name = "Filesystem Integrity Watcher"
+    description = "Recursively tracks content, permissions (mode), and ownership across watched directories"
+
+    def collect(self) -> dict:
+        files = {}
+        watch_dirs = load_watch_dirs()
+        ignore_patterns = load_ignore_patterns()
+
+        def is_ignored(fp_str: str, fname: str) -> bool:
+            return any(
+                fnmatch.fnmatch(fp_str, pat) or fnmatch.fnmatch(fname, pat)
+                for pat in ignore_patterns
+            )
+
+        for target_dir in watch_dirs:
+            path_obj = Path(target_dir)
+            if not path_obj.exists():
+                continue
+            for root, _, filenames in os.walk(path_obj):
+                for fname in filenames:
+                    filepath = Path(root) / fname
+                    fp_str = str(filepath)
+                    if is_ignored(fp_str, fname):
+                        continue
+                    try:
+                        stat = filepath.stat()
+                        files[fp_str] = {
+                            "mtime": stat.st_mtime,
+                            "size": stat.st_size,
+                            "mode": oct(stat.st_mode & 0o7777),  # Octal permission bits (incl. setuid/setgid)
+                            "uid": stat.st_uid,
+                            "gid": stat.st_gid,
+                            "sha256": hash_file(filepath)
+                        }
+                    except (PermissionError, FileNotFoundError):
+                        continue
+        return files
+
+    def diff(self, start: dict, stop: dict, meta_start: dict, meta_stop: dict) -> dict:
+        created, modified, perm_changed, deleted, suid_sgid_alerts = [], [], [], [], []
+
+        for path, info_b in stop.items():
+            if path not in start:
+                created.append(path)
+                if mode_has_suid_sgid(info_b.get("mode", "")):
+                    suid_sgid_alerts.append({
+                        "path": path,
+                        "mode_a": None,
+                        "mode_b": info_b.get("mode", ""),
+                        "reason": "new file created with setuid/setgid bit set"
+                    })
+            else:
+                info_a = start[path]
+                mode_a, mode_b = info_a.get("mode", ""), info_b.get("mode", "")
+
+                # Track mode (chmod) or ownership (chown/chgrp) updates
+                if (mode_a != mode_b or
+                    info_a.get("uid") != info_b.get("uid") or
+                    info_a.get("gid") != info_b.get("gid")):
+                    perm_changed.append({
+                        "path": path,
+                        "mode_a": mode_a,
+                        "mode_b": mode_b
+                    })
+                    if mode_has_suid_sgid(mode_b) and not mode_has_suid_sgid(mode_a):
+                        suid_sgid_alerts.append({
+                            "path": path,
+                            "mode_a": mode_a,
+                            "mode_b": mode_b,
+                            "reason": "setuid/setgid bit added"
+                        })
+
+                # Track file content/data updates
+                if info_a.get("sha256") and info_b.get("sha256"):
+                    if info_a["sha256"] != info_b["sha256"]:
+                        modified.append(path)
+                elif info_a["mtime"] != info_b["mtime"] or info_a["size"] != info_b["size"]:
+                    modified.append(path)
+
+        for path in start:
+            if path not in stop:
+                deleted.append(path)
+
+        return {
+            "created": created,
+            "modified": modified,
+            "perm_changed": perm_changed,
+            "deleted": deleted,
+            "suid_sgid_alerts": suid_sgid_alerts
+        }
+
+    def render(self, diff_data: dict) -> None:
+        if (diff_data["created"] or diff_data["modified"] or diff_data["perm_changed"]
+                or diff_data["deleted"] or diff_data["suid_sgid_alerts"]):
+            print("FILESYSTEM UPDATES")
+            for item in diff_data["suid_sgid_alerts"][:10]:
+                before = item["mode_a"] if item["mode_a"] else "—"
+                print(f"  ! ALERT: setuid/setgid bit set on {item['path']} ({before} → {item['mode_b']})")
+            for f in diff_data["created"][:10]:
+                print(f"  + Created:     {f}")
+            for f in diff_data["modified"][:10]:
+                print(f"  ~ Content Mod: {f}")
+            for item in diff_data["perm_changed"][:10]:
+                print(f"  ! Mode/Perms:  {item['path']} ({item['mode_a']} → {item['mode_b']})")
+            for f in diff_data["deleted"][:10]:
+                print(f"  - Deleted:     {f}")
+
+            total = (len(diff_data['created']) + len(diff_data['modified']) + 
+                     len(diff_data['perm_changed']) + len(diff_data['deleted']))
+            if total > 30:
+                print(f"  ... and {total - 30} additional file modifications")
+            print()
+
+    def summary_metrics(self, diff_data: dict) -> dict:
+        total = (len(diff_data.get("created", [])) + 
+                 len(diff_data.get("modified", [])) + 
+                 len(diff_data.get("perm_changed", [])) + 
+                 len(diff_data.get("deleted", [])))
+        return {
+            "Files Changed": total,
+            "SUID/SGID Alerts": len(diff_data.get("suid_sgid_alerts", []))
+        }
+
+
+class JournalDetector(BaseDetector):
+    name = "System Journal Errors"
+    description = "Extracts journalctl warning/error logs generated during execution window"
+
+    def collect(self) -> dict:
+        return {}
+
+    def diff(self, start: dict, stop: dict, meta_start: dict, meta_stop: dict) -> dict:
+        s_dt = datetime.fromtimestamp(meta_start.get("timestamp", time.time())).strftime("%Y-%m-%d %H:%M:%S")
+        e_dt = datetime.fromtimestamp(meta_stop.get("timestamp", time.time())).strftime("%Y-%m-%d %H:%M:%S")
+        cmd = ["journalctl", f"--since={s_dt}", f"--until={e_dt}", "-p", "3..4", "--no-pager", "-n", "10"]
+        out = run_cmd(cmd)
+        return {"logs": out.splitlines() if out else []}
+
+    def render(self, diff_data: dict) -> None:
+        if diff_data["logs"]:
+            print("SYSTEM JOURNAL ACTIVITY (WARNINGS & ERRORS)")
+            for line in diff_data["logs"]:
+                print(f"  > {line}")
+            print()
+
+    def has_changes(self, diff_data: dict) -> bool:
+        # Journal lines are informational context, not a system change in
+        # themselves — don't let them trip --fail-on-change on their own.
+        return False
+
+
+class MySQLDetector(BaseDetector):
+    name = "MySQL Databases"
+    description = "Tracks newly created or dropped MySQL/MariaDB databases"
+
+    def collect(self) -> dict:
+        # 1. State collection
+        out = run_cmd(["mysql", "-e", "SHOW DATABASES;"])
+        return {"databases": out.splitlines()}
+
+    def diff(self, start: dict, stop: dict, meta_start: dict, meta_stop: dict) -> dict:
+        # 2. State comparison
+        d_a, d_b = set(start.get("databases", [])), set(stop.get("databases", []))
+        return {"created": list(d_b - d_a), "dropped": list(d_a - d_b)}
+
+    def render(self, diff_data: dict) -> None:
+        # 3. Report output rendering
+        if diff_data["created"] or diff_data["dropped"]:
+            print("MYSQL DATABASE CHANGES")
+            for db in diff_data["created"]:
+                print(f"  + Database Created: {db}")
+            for db in diff_data["dropped"]:
+                print(f"  - Database Dropped: {db}")
+            print()
+
+    def summary_metrics(self, diff_data: dict) -> dict:
+        # 4. Final summary box metric
+        return {"Databases Created": len(diff_data.get("created", []))}
+
+# ==============================================================================
+# WATCH MANAGEMENT HANDLERS
+# ==============================================================================
+
+def cmd_watch_list():
+    """List all currently configured watch directories."""
+    dirs = load_watch_dirs()
+    print("CURRENTLY WATCHED DIRECTORIES:")
+    for d in dirs:
+        status = "" if Path(d).exists() else " (Warning: Path does not exist)"
+        print(f"  • {d}{status}")
+    print(f"\nConfiguration file: {CONFIG_FILE}")
+
+
+def cmd_watch_add(path_str: str):
+    """Add a directory to persistent watch list."""
+    target_path = Path(path_str).resolve()
+    abs_str = str(target_path)
+
+    if not target_path.exists():
+        print(f"Warning: '{abs_str}' does not currently exist on disk.", file=sys.stderr)
+    elif not target_path.is_dir():
+        print(f"Error: '{abs_str}' is a file, not a directory.", file=sys.stderr)
+        sys.exit(1)
+
+    dirs = load_watch_dirs()
+    if abs_str in dirs:
+        print(f"Notice: '{abs_str}' is already in the watch list.")
+        return
+
+    dirs.append(abs_str)
+    if save_watch_dirs(dirs):
+        print(f"Successfully added '{abs_str}' to watch list.")
+
+
+def cmd_watch_remove(path_str: str):
+    """Remove a directory from persistent watch list."""
+    target_path = str(Path(path_str).resolve())
+    dirs = load_watch_dirs()
+
+    matched = [d for d in dirs if d == target_path or d == path_str]
+    if not matched:
+        print(f"Error: '{path_str}' is not in the watch list.", file=sys.stderr)
+        sys.exit(1)
+
+    for m in matched:
+        dirs.remove(m)
+
+    if save_watch_dirs(dirs):
+        print(f"Successfully removed '{path_str}' from watch list.")
+
+
+def cmd_ignore_list():
+    """List all currently configured filesystem-watcher ignore patterns."""
+    patterns = load_ignore_patterns()
+    print("FILESYSTEM WATCHER IGNORE PATTERNS:")
+    for p in patterns:
+        print(f"  • {p}")
+    print(f"\nConfiguration file: {CONFIG_FILE}")
+
+
+def cmd_ignore_add(pattern: str):
+    """Add a glob pattern to the persistent ignore list."""
+    patterns = load_ignore_patterns()
+    if pattern in patterns:
+        print(f"Notice: '{pattern}' is already ignored.")
+        return
+    patterns.append(pattern)
+    if save_ignore_patterns(patterns):
+        print(f"Successfully added ignore pattern '{pattern}'.")
+
+
+def cmd_ignore_remove(pattern: str):
+    """Remove a glob pattern from the persistent ignore list."""
+    patterns = load_ignore_patterns()
+    if pattern not in patterns:
+        print(f"Error: '{pattern}' is not in the ignore list.", file=sys.stderr)
+        sys.exit(1)
+    patterns.remove(pattern)
+    if save_ignore_patterns(patterns):
+        print(f"Successfully removed ignore pattern '{pattern}'.")
+
+
+# ==============================================================================
+# REPORT EXPORT HANDLING
+# ==============================================================================
+
+def resolve_export_paths(export_arg: str, export_format: str) -> dict:
+    """
+    Determine the file path(s) a report should be written to, keyed by
+    format ('text' and/or 'json').
+
+    Directory mode (export_arg names an existing directory, or ends in a
+    path separator): a timestamped base filename is generated inside it,
+    e.g. cmdtrace_report_20260101_120000.txt / .json.
+
+    Exact-filename mode (export_arg names a specific file):
+      - format 'text' or 'json': written exactly to that path, as given.
+      - format 'both': the path's extension (if any) is stripped and used
+        as a base, with '.txt' and '.json' appended, e.g.
+        'out' or 'out.txt' -> out.txt and out.json.
+    """
+    target = Path(export_arg).expanduser()
+    looks_like_dir = export_arg.endswith(("/", os.sep)) or target.is_dir()
+    paths = {}
+
+    if looks_like_dir:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        base = target / f"cmdtrace_report_{timestamp}"
+        if export_format in ("text", "both"):
+            paths["text"] = base.with_suffix(".txt")
+        if export_format in ("json", "both"):
+            paths["json"] = base.with_suffix(".json")
+    else:
+        if export_format == "both":
+            base = target.with_suffix("")
+            paths["text"] = base.with_suffix(".txt")
+            paths["json"] = base.with_suffix(".json")
+        elif export_format == "text":
+            paths["text"] = target
+        elif export_format == "json":
+            paths["json"] = target
+
+    return {fmt: p.resolve() for fmt, p in paths.items()}
+
+
+def write_report(report_text: str, report_json: dict, export_arg: str, export_format: str) -> list:
+    """Write the report to disk in the requested format(s). Returns the paths written."""
+    paths = resolve_export_paths(export_arg, export_format)
+    written = []
+    for fmt, path in paths.items():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w") as f:
+            if fmt == "text":
+                f.write(report_text)
+            else:
+                json.dump(report_json, f, indent=2, default=str)
+        written.append(path)
+    return written
+
+
+# ==============================================================================
+# HISTORY LOG
+# ==============================================================================
+
+
+SYSTEM_LOG_FILE = Path("/var/log/cmdtrace/history.log")
+USER_LOG_FILE = Path.home() / ".local/state/cmdtrace/history.log"
+
+def append_history(session_label: str, meta_start: dict, meta_stop: dict, summary: dict) -> None:
+    """Append a summary to system log, falling back to user home directory on permission error."""
+    duration = timedelta(seconds=int(meta_stop["timestamp"] - meta_start.get("timestamp", meta_stop["timestamp"])))
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    metrics_str = ", ".join(f"{k}={v}" for k, v in summary.items())
+    log_line = f"{ts} | session={session_label} | duration={duration} | {metrics_str}\n"
+
+    # Attempt primary system log first, then fallback to user home directory
+    for target_path in (SYSTEM_LOG_FILE, USER_LOG_FILE):
+        try:
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(target_path, "a") as f:
+                f.write(log_line)
+            return  # Successfully written
+        except PermissionError:
+            continue  # Fall through to USER_LOG_FILE
+        except Exception as e:
+            print(f"Warning: could not write to history log ({target_path}): {e}", file=sys.stderr)
+            break
+
+# ==============================================================================
+# SESSION & BASELINE MANAGEMENT
+# ==============================================================================
+
+def get_snapshot_file(session: str) -> Path:
+    """Resolve the on-disk snapshot path for a given session name."""
+    if session == "default":
+        return SNAPSHOT_FILE
+    safe = re.sub(r'[^A-Za-z0-9_.-]', '_', session)
+    return SNAPSHOT_FILE.parent / f"cmdtrace_snapshot_{safe}.json"
+
+
+def get_baseline_file(name: str) -> Path:
+    """Resolve the on-disk path for a named baseline."""
+    safe = re.sub(r'[^A-Za-z0-9_.-]', '_', name)
+    return BASELINE_DIR / f"{safe}.json"
+
+
+def cmd_sessions_list():
+    """List all currently active (started but not yet stopped) sessions."""
+    pattern = str(SNAPSHOT_FILE.parent / "cmdtrace_snapshot*.json")
+    files = sorted(glob.glob(pattern))
+    if not files:
+        print("No active cmdtrace sessions.")
+        return
+
+    print("ACTIVE CMDTRACE SESSIONS:")
+    for f in files:
+        p = Path(f)
+        session_name = "default" if p.name == SNAPSHOT_FILE.name else p.stem.replace("cmdtrace_snapshot_", "", 1)
+        try:
+            with open(p) as fh:
+                meta = json.load(fh).get("_meta", {})
+            started = datetime.fromtimestamp(meta.get("timestamp", 0)).strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            started = "unknown"
+        print(f"  • {session_name:<20} started {started}  ({p})")
+
+
+def cmd_baseline_save(name: str):
+    """Capture the current full system state and store it as a named baseline."""
+    print(f"Capturing current system state as baseline '{name}'...")
+    detectors = get_all_detectors()
+    snapshot = {
+        "_meta": {"timestamp": time.time(), "label": name},
+        "subsystems": collect_all(detectors)
+    }
+    baseline_file = get_baseline_file(name)
+    try:
+        baseline_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(baseline_file, "w") as f:
+            json.dump(snapshot, f)
+        print(f"Baseline '{name}' saved to {baseline_file}")
+    except Exception as e:
+        print(f"Error saving baseline: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_baseline_list():
+    """List all saved baselines."""
+    files = sorted(BASELINE_DIR.glob("*.json")) if BASELINE_DIR.exists() else []
+    if not files:
+        print("No baselines saved yet. Use 'cmdtrace baseline save <name>' to create one.")
+        return
+
+    print("SAVED BASELINES:")
+    for f in files:
+        try:
+            with open(f) as fh:
+                meta = json.load(fh).get("_meta", {})
+            ts = datetime.fromtimestamp(meta.get("timestamp", 0)).strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            ts = "unknown"
+        print(f"  • {f.stem:<20} captured {ts}  ({f})")
+
+
+def cmd_baseline_remove(name: str):
+    """Delete a saved baseline."""
+    baseline_file = get_baseline_file(name)
+    if not baseline_file.exists():
+        print(f"Error: baseline '{name}' does not exist.", file=sys.stderr)
+        sys.exit(1)
+    try:
+        baseline_file.unlink()
+        print(f"Baseline '{name}' removed.")
+    except Exception as e:
+        print(f"Error removing baseline: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+# ==============================================================================
+# CLI EXECUTION ROUTER & ENGINE
+# ==============================================================================
+
+def cmd_help():
+    detectors = get_all_detectors()
+    detector_help_text = "\n".join([d.get_help_text() for d in detectors])
+    current_dirs = load_watch_dirs()
+    current_ignores = load_ignore_patterns()
+
+    help_text = f"""
+================================================================================
+cmdtrace — Modular Linux System Change Tracking Manual
+================================================================================
+
+OVERVIEW:
+  cmdtrace captures full snapshots before and after an operation to isolate 
+  packages installed, files modified, ports opened, services changed, and journal errors.
+
+USAGE PATTERNS:
+  1. Interactive Session (Start / Stop):
+     sudo cmdtrace start
+     sudo apt install nginx
+     sudo cmdtrace stop
+
+  2. Direct Wrapper Session (Run):
+     sudo cmdtrace run -- apt install -y nginx
+
+  3. Exporting a Report:
+     sudo cmdtrace stop --export /var/log/cmdtrace/
+     sudo cmdtrace stop --export /var/log/cmdtrace/nginx_install.txt
+     sudo cmdtrace stop --export /var/log/cmdtrace/ --export-format json
+     sudo cmdtrace run --export ~/reports --export-format both -- apt install -y nginx
+
+  4. Concurrent / Named Sessions:
+     sudo cmdtrace start --session db_migration
+     sudo cmdtrace stop --session db_migration
+     sudo cmdtrace sessions
+
+  5. Golden Baseline Comparison (drift/compliance checks):
+     sudo cmdtrace baseline save known_good
+     sudo cmdtrace compare known_good --export /var/log/cmdtrace/drift/
+
+  6. CI / Automation Gate:
+     sudo cmdtrace run --fail-on-change -- ./deploy.sh   # non-zero exit if anything changed
+
+  7. Dynamic Watch List & Ignore Pattern Management:
+     sudo cmdtrace watch list
+     sudo cmdtrace watch add /etc/nginx
+     sudo cmdtrace watch remove /var/www
+     sudo cmdtrace watch ignore list
+     sudo cmdtrace watch ignore add "*.cache"
+     sudo cmdtrace watch ignore remove "*.tmp"
+
+COMMAND REFERENCE:
+  start                     Capture baseline system snapshot and start filesystem activity tracking
+    --session, -s NAME      Use a named session (default: "default"); allows concurrent traces
+  stop                      Stop filesystem activity tracking, compare, and print change report
+    --session, -s NAME      Match the session name used with 'start'
+    --export, -e PATH       Also save the report to PATH (directory or exact filename)
+    --export-format FMT     text (default) | json | both
+    --fail-on-change        Exit with status 2 if any detector reports a change
+    --no-history            Skip appending a summary line to the history log
+  run -- <command>          Automatically wrap command execution with start and stop
+    (accepts the same --session / --export / --export-format / --fail-on-change / --no-history flags)
+  sessions                  List all currently active (started, not yet stopped) sessions
+  baseline save <name>      Snapshot current system state and store it as a named baseline
+  baseline list             List all saved baselines
+  baseline remove <name>    Delete a saved baseline
+  compare <name>            Diff current live state against a saved baseline (no start/stop needed)
+    (accepts the same --export / --export-format / --fail-on-change / --no-history flags)
+  watch list                List all currently monitored filesystem directories
+  watch add <path>          Add a directory tree to persistent monitoring config
+  watch remove <path>       Remove a directory tree from monitoring config
+  watch ignore list         List glob patterns excluded from the filesystem watcher
+  watch ignore add <glob>   Add an exclusion glob pattern (e.g. "*.log", "*/tmp/*")
+  watch ignore remove <glob> Remove an exclusion glob pattern
+  help                      Display this detailed user manual
+
+REGISTERED DETECTOR MODULES ({len(detectors)} MODULES ACTIVE):
+{detector_help_text}
+
+WATCHED DIRECTORIES ({len(current_dirs)} PATHS ACTIVE):
+  {', '.join(current_dirs)}
+
+IGNORED PATTERNS ({len(current_ignores)} PATTERNS ACTIVE):
+  {', '.join(current_ignores)}
+  Persistent config: {CONFIG_FILE}
+  Saved baselines:   {BASELINE_DIR}
+  History log:       {HISTORY_LOG_FILE}
+================================================================================
+"""
+    print(help_text)
+
+
+def build_report(meta_start: dict, start_subsystems: dict, meta_stop: dict, stop_subsystems: dict,
+                  detectors: list, report_title: str = "CMDTRACE MASTER CHANGE REPORT",
+                  filesystem_events: list = None) -> tuple:
+    """
+    Diff and render every detector, producing both the human-readable report
+    text and a JSON-serializable equivalent. Returns
+    (report_text, report_json, any_changes).
+    """
+    duration = timedelta(seconds=int(meta_stop["timestamp"] - meta_start.get("timestamp", meta_stop["timestamp"])))
+
+    summary_accumulator = {}
+    json_subsystems = {}
+    any_changes = False
+
+    report_buffer = io.StringIO()
+    with contextlib.redirect_stdout(report_buffer):
+        print("================================================================================")
+        print(f"{report_title:^80}")
+        print("================================================================================")
+        print(f"Generated:      {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"Trace Duration: {duration}\n")
+
+        for d in detectors:
+            key = d.__class__.__name__
+            d_start = start_subsystems.get(key, {})
+            d_stop = stop_subsystems.get(key, {})
+
+            diff_data = d.diff(d_start, d_stop, meta_start, meta_stop)
+            d.render(diff_data)
+
+            metrics = d.summary_metrics(diff_data)
+            summary_accumulator.update(metrics)
+            json_subsystems[key] = diff_data
+
+            if d.has_changes(diff_data):
+                any_changes = True
+
+        if filesystem_events:
+            render_filesystem_activity(filesystem_events)
+            summary_accumulator.update(filesystem_activity_metrics(filesystem_events))
+            json_subsystems["FilesystemActivity"] = {"events": filesystem_events}
+            any_changes = True
+
+        print("================================================================================")
+        print("SUMMARY")
+        for metric_name, value in summary_accumulator.items():
+            print(f"  {metric_name:<22}: {value}")
+        print("================================================================================")
+
+    report_text = report_buffer.getvalue()
+    report_json = {
+        "generated": datetime.now().isoformat(),
+        "trace_duration_seconds": int(duration.total_seconds()),
+        "any_changes": any_changes,
+        "summary": summary_accumulator,
+        "subsystems": json_subsystems
+    }
+    return report_text, report_json, any_changes
+
+
+def export_report_if_requested(report_text: str, report_json: dict, export_arg: str, export_format: str) -> None:
+    """Shared export step used by stop/run/compare: write to disk and report the path(s)."""
+    if not export_arg:
+        return
+    try:
+        for path in write_report(report_text, report_json, export_arg, export_format):
+            print(f"Report exported to: {path}")
+    except Exception as e:
+        print(f"Error exporting report: {e}", file=sys.stderr)
+
+
+def cmd_start(session: str = "default"):
+    if os.geteuid() != 0:
+        print("Notice: Running without root privileges. System inspection will be limited.\n")
+
+    print(f"Capturing baseline system state across all registered detectors (session: {session})...")
+    detectors = get_all_detectors()
+
+    snapshot = {
+        "_meta": {"timestamp": time.time(), "session": session},
+        "subsystems": collect_all(detectors)
+    }
+
+    snapshot_file = get_snapshot_file(session)
+    try:
+        snapshot_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(snapshot_file, "w") as f:
+            json.dump(snapshot, f)
+        monitor_meta = start_filesystem_monitor(session)
+        if monitor_meta:
+            snapshot["_meta"]["filesystem_monitor"] = monitor_meta
+            with open(snapshot_file, "w") as f:
+                json.dump(snapshot, f)
+            print(f"Baseline captured successfully at {datetime.now().strftime('%H:%M:%S')} ({len(detectors)} modules).")
+            print("Filesystem activity timeline: active")
+        else:
+            print(f"Baseline captured successfully at {datetime.now().strftime('%H:%M:%S')} ({len(detectors)} modules).")
+            print("Warning: filesystem activity timeline is unavailable; snapshot diff remains active.", file=sys.stderr)
+    except Exception as e:
+        print(f"Error saving snapshot: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_stop(session: str = "default", export_arg: str = None, export_format: str = "text",
+             fail_on_change: bool = False, no_history: bool = False):
+    snapshot_file = get_snapshot_file(session)
+    if not snapshot_file.exists():
+        print(f"Error: No active cmdtrace session '{session}' found. Run 'cmdtrace start "
+              f"{'--session ' + session if session != 'default' else ''}' first.", file=sys.stderr)
+        sys.exit(1)
+
+    print("Capturing ending system state and comparing...")
+    try:
+        with open(snapshot_file, "r") as f:
+            start_snapshot = json.load(f)
+    except Exception as e:
+        print(f"Error loading snapshot: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    filesystem_events = stop_filesystem_monitor(start_snapshot.get("_meta", {}))
+    meta_stop = {"timestamp": time.time()}
+    detectors = get_all_detectors()
+    stop_subsystems = collect_all(detectors)
+
+    meta_start = start_snapshot.get("_meta", {})
+    start_subsystems = start_snapshot.get("subsystems", {})
+
+    report_text, report_json, any_changes = build_report(
+        meta_start, start_subsystems, meta_stop, stop_subsystems, detectors,
+        filesystem_events=filesystem_events
+    )
+    print(report_text)
+
+    export_report_if_requested(report_text, report_json, export_arg, export_format)
+
+    if not no_history:
+        append_history(session, meta_start, meta_stop, report_json["summary"])
+
+    try:
+        snapshot_file.unlink()
+    except Exception:
+        pass
+
+    if fail_on_change and any_changes:
+        sys.exit(2)
+
+
+def cmd_run(command_args: list, session: str = "default", export_arg: str = None, export_format: str = "text",
+            fail_on_change: bool = False, no_history: bool = False):
+    print(f"Starting cmdtrace session for execution wrapper: {' '.join(command_args)}")
+    cmd_start(session=session)
+    print("\n--------------------------------------------------------------------------------")
+    try:
+        subprocess.run(command_args, check=False)
+    except Exception as e:
+        print(f"Command execution failed: {e}", file=sys.stderr)
+    print("--------------------------------------------------------------------------------\n")
+    cmd_stop(session=session, export_arg=export_arg, export_format=export_format,
+              fail_on_change=fail_on_change, no_history=no_history)
+
+
+def cmd_compare(name: str, export_arg: str = None, export_format: str = "text",
+                 fail_on_change: bool = False, no_history: bool = False):
+    baseline_file = get_baseline_file(name)
+    if not baseline_file.exists():
+        print(f"Error: baseline '{name}' not found. Run 'cmdtrace baseline save {name}' first.", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        with open(baseline_file, "r") as f:
+            baseline_snapshot = json.load(f)
+    except Exception as e:
+        print(f"Error loading baseline: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Capturing current system state and comparing against baseline '{name}'...")
+    meta_stop = {"timestamp": time.time()}
+    detectors = get_all_detectors()
+    stop_subsystems = collect_all(detectors)
+
+    meta_start = baseline_snapshot.get("_meta", {})
+    start_subsystems = baseline_snapshot.get("subsystems", {})
+
+    report_text, report_json, any_changes = build_report(
+        meta_start, start_subsystems, meta_stop, stop_subsystems, detectors,
+        report_title=f"CMDTRACE BASELINE COMPARISON: {name}"
+    )
+    print(report_text)
+
+    export_report_if_requested(report_text, report_json, export_arg, export_format)
+
+    if not no_history:
+        append_history(f"baseline:{name}", meta_start, meta_stop, report_json["summary"])
+
+    if fail_on_change and any_changes:
+        sys.exit(2)
+
+
+def _add_export_and_gate_args(subparser):
+    """Shared --export/--export-format/--fail-on-change/--no-history flags for stop/run/compare."""
+    subparser.add_argument(
+        "--export", "-e", metavar="PATH", default=None,
+        help="Save the change report to PATH. If PATH is a directory, a timestamped "
+             "report file is created inside it; otherwise PATH is used as the exact filename."
+    )
+    subparser.add_argument(
+        "--export-format", choices=["text", "json", "both"], default="text",
+        help="Format for --export output (default: text)."
+    )
+    subparser.add_argument(
+        "--fail-on-change", action="store_true",
+        help="Exit with status 2 if any detector reports a change (useful in CI/automation)."
+    )
+    subparser.add_argument(
+        "--no-history", action="store_true",
+        help="Skip appending a summary line to the persistent history log."
+    )
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="cmdtrace — Modular Linux System Change Tracking Tool",
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    subparsers = parser.add_subparsers(dest="command", required=False)
+
+    start_parser = subparsers.add_parser("start", help="Capture baseline system state")
+    start_parser.add_argument(
+        "--session", "-s", metavar="NAME", default="default",
+        help="Named session, allowing multiple concurrent traces (default: 'default')."
+    )
+
+    stop_parser = subparsers.add_parser("stop", help="Capture ending state and generate change report")
+    stop_parser.add_argument(
+        "--session", "-s", metavar="NAME", default="default",
+        help="Named session matching the one used with 'start' (default: 'default')."
+    )
+    _add_export_and_gate_args(stop_parser)
+
+    subparsers.add_parser("help", help="Display full manual and active detector registry")
+
+    run_parser = subparsers.add_parser("run", help="Run a command wrapped in automatic cmdtrace tracing")
+    run_parser.add_argument(
+        "--session", "-s", metavar="NAME", default="default",
+        help="Named session, allowing multiple concurrent traces (default: 'default')."
+    )
+    _add_export_and_gate_args(run_parser)
+    run_parser.add_argument("cmd_args", nargs=argparse.REMAINDER, help="Command and arguments to execute")
+
+    subparsers.add_parser("sessions", help="List all currently active (started, not yet stopped) sessions")
+
+    baseline_parser = subparsers.add_parser("baseline", help="Manage saved golden baselines for drift comparison")
+    baseline_subparsers = baseline_parser.add_subparsers(dest="baseline_command", required=False)
+    bl_save = baseline_subparsers.add_parser("save", help="Capture current state and store it as a named baseline")
+    bl_save.add_argument("name", help="Name for this baseline")
+    baseline_subparsers.add_parser("list", help="List all saved baselines")
+    bl_rm = baseline_subparsers.add_parser("remove", help="Delete a saved baseline")
+    bl_rm.add_argument("name", help="Name of the baseline to remove")
+
+    compare_parser = subparsers.add_parser("compare", help="Diff current live state against a saved baseline")
+    compare_parser.add_argument("name", help="Name of the baseline to compare against")
+    _add_export_and_gate_args(compare_parser)
+
+    watch_parser = subparsers.add_parser("watch", help="Manage dynamic filesystem watch directories")
+    watch_subparsers = watch_parser.add_subparsers(dest="watch_command", required=False)
+    watch_subparsers.add_parser("list", help="List all currently watched directories")
+
+    add_p = watch_subparsers.add_parser("add", help="Add a directory to the watch list")
+    add_p.add_argument("path", help="Directory path to watch")
+
+    rm_p = watch_subparsers.add_parser("remove", help="Remove a directory from the watch list")
+    rm_p.add_argument("path", help="Directory path to remove")
+
+    ignore_parser = watch_subparsers.add_parser("ignore", help="Manage filesystem watcher ignore patterns")
+    ignore_subparsers = ignore_parser.add_subparsers(dest="ignore_command", required=False)
+    ignore_subparsers.add_parser("list", help="List all currently ignored glob patterns")
+    ig_add = ignore_subparsers.add_parser("add", help="Add a glob pattern to the ignore list")
+    ig_add.add_argument("pattern", help="Glob pattern, e.g. '*.log' or '*/tmp/*'")
+    ig_rm = ignore_subparsers.add_parser("remove", help="Remove a glob pattern from the ignore list")
+    ig_rm.add_argument("pattern", help="Glob pattern to remove")
+
+    # Internal command used by start to keep the monitor alive after start exits.
+    fswatch_parser = subparsers.add_parser("_fswatch", help=argparse.SUPPRESS)
+    fswatch_parser.add_argument("--event-file", required=True)
+
+    args = parser.parse_args()
+
+    if args.command == "_fswatch":
+        sys.exit(_run_filesystem_monitor(Path(args.event_file)))
+    elif args.command == "start":
+        cmd_start(session=args.session)
+    elif args.command == "stop":
+        cmd_stop(session=args.session, export_arg=args.export, export_format=args.export_format,
+                  fail_on_change=args.fail_on_change, no_history=args.no_history)
+    elif args.command == "run":
+        if not args.cmd_args:
+            print("Error: No command provided for 'cmdtrace run'. Example: cmdtrace run -- apt install nginx")
+            sys.exit(1)
+        target_cmd = args.cmd_args[1:] if args.cmd_args[0] == "--" else args.cmd_args
+        cmd_run(target_cmd, session=args.session, export_arg=args.export, export_format=args.export_format,
+                 fail_on_change=args.fail_on_change, no_history=args.no_history)
+    elif args.command == "sessions":
+        cmd_sessions_list()
+    elif args.command == "baseline":
+        if args.baseline_command == "save":
+            cmd_baseline_save(args.name)
+        elif args.baseline_command == "remove":
+            cmd_baseline_remove(args.name)
+        else:
+            cmd_baseline_list()
+    elif args.command == "compare":
+        cmd_compare(args.name, export_arg=args.export, export_format=args.export_format,
+                     fail_on_change=args.fail_on_change, no_history=args.no_history)
+    elif args.command == "watch":
+        if args.watch_command == "list":
+            cmd_watch_list()
+        elif args.watch_command == "add":
+            cmd_watch_add(args.path)
+        elif args.watch_command == "remove":
+            cmd_watch_remove(args.path)
+        elif args.watch_command == "ignore":
+            if args.ignore_command == "add":
+                cmd_ignore_add(args.pattern)
+            elif args.ignore_command == "remove":
+                cmd_ignore_remove(args.pattern)
+            else:
+                cmd_ignore_list()
+        else:
+            cmd_watch_list()
+    elif args.command == "help" or len(sys.argv) == 1:
+        cmd_help()
+
+
+if __name__ == "__main__":
+    main()
