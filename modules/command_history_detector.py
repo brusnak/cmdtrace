@@ -161,6 +161,7 @@ fi
         result["warning"] = (
             f"Installed cmdtrace shell history hook in {startup}. "
             "It will become active when this shell next sources its startup file."
+            "Please stop cmdtrace, restart your shell, and then re-run cmdtrace to capture history changes."
         )
         return result
 
