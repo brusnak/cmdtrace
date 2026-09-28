@@ -169,6 +169,31 @@ def save_ignore_patterns(patterns: list) -> bool:
     return save_config(cfg)
 
 
+def load_disabled_detectors() -> list:
+    """Return the detector keys the user has disabled.
+
+    A *disabled* list (rather than an enabled list) is stored on purpose: any
+    detector that is new to this config -- a newly added external module, or a
+    built-in added in a future version -- is enabled by default.
+    """
+    disabled = load_config().get("disabled_detectors", [])
+    return sorted({str(k) for k in disabled}) if isinstance(disabled, list) else []
+
+
+def save_disabled_detectors(keys: list) -> bool:
+    """Persist the list of disabled detector keys."""
+    cfg = load_config()
+    cfg["disabled_detectors"] = sorted(set(keys))
+    return save_config(cfg)
+
+
+def config_is_writable() -> bool:
+    """True if cmdtrace can write its persistent config (normally requires root)."""
+    if CONFIG_FILE.exists():
+        return os.access(CONFIG_FILE, os.W_OK)
+    return os.access(CONFIG_FILE.parent, os.W_OK)
+
+
 def load_module_path() -> Optional[Path]:
     """Return the configured external detector-module directory, if one is set."""
     configured = load_config().get(MODULE_PATH_CONFIG_KEY)
@@ -773,15 +798,32 @@ def load_external_detector_modules() -> None:
             print(f"Warning: external detector module '{module_file}' failed to load: {exc}", file=sys.stderr)
 
 
-def get_all_detectors() -> list:
-    """Return built-in detectors first, followed by optional external detectors."""
+def get_all_detectors(include_disabled: bool = False) -> list:
+    """Return built-in detectors first, followed by optional external detectors.
+
+    Detectors the user has disabled (see `cmdtrace --enable-modules`) are left
+    out unless include_disabled=True. A detector class that cannot be
+    instantiated (e.g. an external module missing a required method) is skipped
+    with a warning instead of stopping every cmdtrace command.
+    """
     load_external_detector_modules()
     classes = list(_BUILTIN_DETECTOR_CLASSES)
     builtin_ids = {id(cls) for cls in classes}
     for cls in BaseDetector.__subclasses__():
         if id(cls) not in builtin_ids:
             classes.append(cls)
-    return [cls() for cls in classes]
+
+    detectors = []
+    for cls in classes:
+        try:
+            detectors.append(cls())
+        except Exception as e:
+            print(f"Warning: could not load detector '{cls.__name__}': {e}", file=sys.stderr)
+
+    if include_disabled:
+        return detectors
+    disabled = set(load_disabled_detectors())
+    return [d for d in detectors if d.detector_key() not in disabled]
 
 
 def collect_all(detectors: list) -> dict:
@@ -1634,24 +1676,38 @@ def cmd_set_module_path(path_str: str) -> None:
         print(f"External detector module path set to: {path}")
 
 
+def _detector_source_label(d) -> str:
+    """Short 'built-in' / 'external: file.py' label for a detector instance."""
+    if d.__class__ in _BUILTIN_DETECTOR_CLASSES:
+        return "built-in"
+    source = getattr(sys.modules.get(d.__class__.__module__), "__file__", None)
+    return f"external: {Path(source).name}" if source else "external"
+
+
 def cmd_modules_list() -> None:
-    """Display built-in and externally loaded detector modules."""
-    load_external_detector_modules()
+    """Display built-in and externally loaded detector modules, with enabled/disabled status."""
     module_path = load_module_path()
+    detectors = get_all_detectors(include_disabled=True)
+    disabled = set(load_disabled_detectors())
+    enabled_count = sum(1 for d in detectors if d.detector_key() not in disabled)
+
     print("CMDTRACE DETECTOR MODULES")
+    print(f"  {enabled_count} of {len(detectors)} enabled   ([x] enabled, [ ] disabled)")
+
+    builtin = [d for d in detectors if d.__class__ in _BUILTIN_DETECTOR_CLASSES]
+    external = [d for d in detectors if d.__class__ not in _BUILTIN_DETECTOR_CLASSES]
+
     print("\nBUILT-IN DETECTORS:")
-    for cls in _BUILTIN_DETECTOR_CLASSES:
-        print(f"  • {cls.__name__:<30} {cls.name}")
+    for d in builtin:
+        mark = " " if d.detector_key() in disabled else "x"
+        print(f"  [{mark}] {d.__class__.__name__:<30} {d.name}")
 
     print("\nEXTERNAL DETECTORS:")
-    external_classes = [
-        cls for cls in BaseDetector.__subclasses__()
-        if cls not in _BUILTIN_DETECTOR_CLASSES
-    ]
-    if external_classes:
-        for cls in external_classes:
-            source = getattr(sys.modules.get(cls.__module__), "__file__", "unknown")
-            print(f"  • {cls.__name__:<30} {cls.name}  [{source}]")
+    if external:
+        for d in external:
+            mark = " " if d.detector_key() in disabled else "x"
+            source = getattr(sys.modules.get(d.__class__.__module__), "__file__", "unknown")
+            print(f"  [{mark}] {d.__class__.__name__:<30} {d.name}  [{source}]")
     else:
         print("  (none loaded)")
 
@@ -1660,6 +1716,154 @@ def cmd_modules_list() -> None:
         print("\nMODULE LOAD ERRORS:")
         for item in _EXTERNAL_MODULE_ERRORS:
             print(f"  ! {item['file']}: {item['error']}")
+    print("\nChange what runs with: sudo cmdtrace --enable-modules")
+
+
+def _require_writable_config() -> None:
+    """Exit early, before any interactive work, if the config can't be saved."""
+    if not config_is_writable():
+        print(f"Error: cannot write {CONFIG_FILE}. Changing enabled detectors requires "
+              f"permission to modify it (try running with sudo).", file=sys.stderr)
+        sys.exit(1)
+
+
+def _parse_menu_selection(text: str, count: int):
+    """Parse a menu line such as "3", "3 5,7" or "4-8" into a sorted list of 1-based numbers.
+
+    Returns (numbers, error_message). Nothing is applied if any token is invalid.
+    """
+    numbers = set()
+    for token in text.replace(",", " ").split():
+        if re.fullmatch(r"\d+", token):
+            lo = hi = int(token)
+        elif re.fullmatch(r"\d+-\d+", token):
+            lo, hi = (int(x) for x in token.split("-"))
+            if lo > hi:
+                return [], f"'{token}' is a backwards range"
+        else:
+            return [], f"'{token}' is not a number, range, or command"
+        if lo < 1 or hi > count:
+            return [], f"'{token}' is outside 1-{count}"
+        numbers.update(range(lo, hi + 1))
+    return sorted(numbers), None
+
+
+def cmd_enable_modules() -> None:
+    """Interactive picker: list every detector and toggle each on or off."""
+    _require_writable_config()
+    detectors = get_all_detectors(include_disabled=True)
+    if not detectors:
+        print("No detector modules are available.")
+        return
+
+    keys = [d.detector_key() for d in detectors]
+    saved_disabled = set(load_disabled_detectors())
+    enabled = {k: (k not in saved_disabled) for k in keys}
+    saved_enabled = dict(enabled)
+
+    name_width = max(len(d.name) for d in detectors)
+
+    def show():
+        print("\nCMDTRACE DETECTOR MODULES -- enable / disable")
+        print("-" * 78)
+        for i, d in enumerate(detectors, 1):
+            mark = "x" if enabled[keys[i - 1]] else " "
+            print(f"  {i:>2}. [{mark}] {d.name:<{name_width}}  {_detector_source_label(d)}")
+        on = sum(enabled.values())
+        pending = "   (unsaved changes)" if enabled != saved_enabled else ""
+        print("-" * 78)
+        print(f"  {on} of {len(detectors)} enabled{pending}")
+        print("  Type numbers to toggle (e.g. 3   3 5 7   4-8)   "
+              "a=all on   n=all off   s=save   q=quit without saving")
+
+    while True:
+        show()
+        try:
+            line = input("Selection> ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\nNo changes saved.")
+            return
+
+        if not line:
+            continue
+        if line in ("q", "quit", "exit"):
+            print("No changes saved.")
+            return
+        if line in ("a", "all"):
+            enabled = {k: True for k in keys}
+            continue
+        if line in ("n", "none"):
+            enabled = {k: False for k in keys}
+            continue
+        if line in ("s", "save"):
+            if enabled == saved_enabled:
+                print("No changes to save.")
+                return
+            # Keep entries for detectors that aren't loaded right now (e.g. an
+            # external module whose path is temporarily unset) so their
+            # disabled state isn't silently lost.
+            new_disabled = (saved_disabled - set(keys)) | {k for k in keys if not enabled[k]}
+            if not any(enabled.values()):
+                print("Warning: every detector is disabled; reports will contain no "
+                      "detector results (the filesystem timeline is unaffected).", file=sys.stderr)
+            if save_disabled_detectors(sorted(new_disabled)):
+                print(f"Saved: {sum(enabled.values())} of {len(detectors)} detectors enabled.")
+            else:
+                sys.exit(1)
+            return
+
+        numbers, error = _parse_menu_selection(line, len(detectors))
+        if error:
+            print(f"Invalid input: {error}")
+            continue
+        for n in numbers:
+            enabled[keys[n - 1]] = not enabled[keys[n - 1]]
+
+
+def _resolve_detector_selectors(selectors: list, detectors: list):
+    """Map user-supplied names to detector keys.
+
+    Accepts a detector key, class name, or display name (case-insensitive), or
+    the word 'all'. Returns (keys, error_message).
+    """
+    if any(sel.lower() == "all" for sel in selectors):
+        return [d.detector_key() for d in detectors], None
+
+    resolved = []
+    for sel in selectors:
+        wanted = sel.lower()
+        matches = [
+            d for d in detectors
+            if wanted in (d.detector_key().lower(), d.__class__.__name__.lower(), d.name.lower())
+        ]
+        if not matches:
+            valid = ", ".join(d.__class__.__name__ for d in detectors)
+            return [], f"unknown detector '{sel}'. Valid names: {valid}"
+        if len(matches) > 1:
+            return [], f"'{sel}' matches more than one detector; use the full key: " + \
+                   ", ".join(d.detector_key() for d in matches)
+        resolved.append(matches[0].detector_key())
+    return resolved, None
+
+
+def cmd_set_detectors_enabled(selectors: list, enable: bool) -> None:
+    """Non-interactive enable/disable, for scripts and automation."""
+    _require_writable_config()
+    detectors = get_all_detectors(include_disabled=True)
+    keys, error = _resolve_detector_selectors(selectors, detectors)
+    if error:
+        print(f"Error: {error}", file=sys.stderr)
+        sys.exit(1)
+
+    disabled = set(load_disabled_detectors())
+    disabled = disabled - set(keys) if enable else disabled | set(keys)
+    if save_disabled_detectors(sorted(disabled)):
+        by_key = {d.detector_key(): d for d in detectors}
+        verb = "Enabled" if enable else "Disabled"
+        for k in dict.fromkeys(keys):
+            print(f"{verb}: {by_key[k].name}")
+    else:
+        sys.exit(1)
 
 
 # ==============================================================================
@@ -1897,7 +2101,20 @@ USAGE PATTERNS:
      Built-in detectors in this script are loaded first. Any .py detector
      modules found in the configured directory are then loaded afterward.
 
-  9. Dynamic Watch List & Ignore Pattern Management:
+  9. Enabling / Disabling Detectors:
+     sudo cmdtrace --enable-modules              # interactive checklist
+     sudo cmdtrace modules disable MySQLDetector # or from a script
+     sudo cmdtrace modules enable all
+
+     Disabled detectors are skipped by start, stop, run, compare and
+     baseline save, and the report lists which detectors were not run. New
+     detectors (e.g. a newly added external module) are enabled by default.
+     A stop/compare only diffs detectors that were captured in its start
+     snapshot or baseline, so changing this mid-session cannot cause false
+     "everything is new" results. The live filesystem activity timeline is a
+     separate collector and is not affected by these settings.
+
+ 10. Dynamic Watch List & Ignore Pattern Management:
      sudo cmdtrace watch list
      sudo cmdtrace watch add /etc/nginx
      sudo cmdtrace watch remove /var/www
@@ -1929,10 +2146,13 @@ COMMAND REFERENCE:
   watch ignore add <glob>   Add an exclusion glob pattern (e.g. "*.log", "*/tmp/*")
   watch ignore remove <glob> Remove an exclusion glob pattern
   set module path <path>    Set the external detector module directory
-  modules                   List built-in and loaded external detector modules
+  modules                   List detector modules and whether each is enabled
+  modules enable <name>...  Enable detectors by class name, key or display name (or 'all')
+  modules disable <name>... Disable detectors (or 'all')
+  --enable-modules          Interactive checklist to enable/disable detectors
   help                      Display this detailed user manual
 
-REGISTERED DETECTOR MODULES ({len(detectors)} MODULES ACTIVE):
+REGISTERED DETECTOR MODULES ({len(detectors)} MODULES ACTIVE, {len(get_all_detectors(include_disabled=True)) - len(detectors)} DISABLED):
 {detector_help_text}
 
 WATCHED DIRECTORIES ({len(current_dirs)} PATHS ACTIVE):
@@ -1950,9 +2170,31 @@ IGNORED PATTERNS ({len(current_ignores)} PATTERNS ACTIVE):
     print(help_text)
 
 
+def select_detectors_for_snapshot(start_subsystems: dict, missing_reason: str) -> tuple:
+    """Decide which detectors take part in a stop/compare diff.
+
+    A detector runs only if it is enabled AND its state was captured in the
+    start snapshot / baseline. The second rule matters: a detector enabled
+    *after* the snapshot was taken has no "before" data, so diffing it would
+    report its entire current state (every package, every file...) as new.
+    Returns (detectors_to_run, [(name, reason), ...] for those left out).
+    """
+    disabled = set(load_disabled_detectors())
+    to_run, skipped = [], []
+    for d in get_all_detectors(include_disabled=True):
+        key = d.detector_key()
+        if key in disabled:
+            skipped.append((d.name, "disabled"))
+        elif key not in start_subsystems:
+            skipped.append((d.name, missing_reason))
+        else:
+            to_run.append(d)
+    return to_run, skipped
+
+
 def build_report(meta_start: dict, start_subsystems: dict, meta_stop: dict, stop_subsystems: dict,
                   detectors: list, report_title: str = "CMDTRACE MASTER CHANGE REPORT",
-                  filesystem_events: list = None) -> tuple:
+                  filesystem_events: list = None, skipped_detectors: list = None) -> tuple:
     """
     Diff and render every detector, producing both the human-readable report
     text and a JSON-serializable equivalent. Returns
@@ -1970,7 +2212,12 @@ def build_report(meta_start: dict, start_subsystems: dict, meta_stop: dict, stop
         print(f"{report_title:^80}")
         print("================================================================================")
         print(f"Generated:      {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        print(f"Trace Duration: {duration}\n")
+        print(f"Trace Duration: {duration}")
+        if skipped_detectors:
+            print("Detectors not run:")
+            for skipped_name, skipped_reason in skipped_detectors:
+                print(f"  - {skipped_name} ({skipped_reason})")
+        print()
 
         for d in detectors:
             key = d.detector_key()
@@ -2005,6 +2252,7 @@ def build_report(meta_start: dict, start_subsystems: dict, meta_stop: dict, stop
         "trace_duration_seconds": int(duration.total_seconds()),
         "any_changes": any_changes,
         "summary": summary_accumulator,
+        "skipped_detectors": [{"name": n, "reason": r} for n, r in (skipped_detectors or [])],
         "subsystems": json_subsystems
     }
     return report_text, report_json, any_changes
@@ -2071,15 +2319,14 @@ def cmd_stop(session: str = "default", export_arg: str = None, export_format: st
 
     filesystem_events = stop_event_collector(start_snapshot.get("_meta", {}).get("event_collector", {}))
     meta_stop = {"timestamp": time.time()}
-    detectors = get_all_detectors()
-    stop_subsystems = collect_all(detectors)
-
     meta_start = start_snapshot.get("_meta", {})
     start_subsystems = start_snapshot.get("subsystems", {})
+    detectors, skipped = select_detectors_for_snapshot(start_subsystems, "not captured at start")
+    stop_subsystems = collect_all(detectors)
 
     report_text, report_json, any_changes = build_report(
         meta_start, start_subsystems, meta_stop, stop_subsystems, detectors,
-        filesystem_events=filesystem_events
+        filesystem_events=filesystem_events, skipped_detectors=skipped
     )
     print(report_text)
 
@@ -2127,15 +2374,15 @@ def cmd_compare(name: str, export_arg: str = None, export_format: str = "text",
 
     print(f"Capturing current system state and comparing against baseline '{name}'...")
     meta_stop = {"timestamp": time.time()}
-    detectors = get_all_detectors()
-    stop_subsystems = collect_all(detectors)
-
     meta_start = baseline_snapshot.get("_meta", {})
     start_subsystems = baseline_snapshot.get("subsystems", {})
+    detectors, skipped = select_detectors_for_snapshot(start_subsystems, "not in baseline")
+    stop_subsystems = collect_all(detectors)
 
     report_text, report_json, any_changes = build_report(
         meta_start, start_subsystems, meta_stop, stop_subsystems, detectors,
-        report_title=f"CMDTRACE BASELINE COMPARISON: {name}"
+        report_title=f"CMDTRACE BASELINE COMPARISON: {name}",
+        skipped_detectors=skipped
     )
     print(report_text)
 
@@ -2173,6 +2420,10 @@ def main():
     parser = argparse.ArgumentParser(
         description="cmdtrace — Modular Linux System Change Tracking Tool",
         formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument(
+        "--enable-modules", action="store_true",
+        help="Interactively enable or disable individual detector modules."
     )
     subparsers = parser.add_subparsers(dest="command", required=False)
 
@@ -2238,7 +2489,13 @@ def main():
     set_module_path_parser = set_module_subparsers.add_parser("path", help="Set the external detector module directory")
     set_module_path_parser.add_argument("path", help="Directory containing external cmdtrace detector .py modules")
 
-    subparsers.add_parser("modules", help="List built-in and loaded external detector modules")
+    modules_parser = subparsers.add_parser("modules", help="List detector modules, or enable/disable them")
+    modules_subparsers = modules_parser.add_subparsers(dest="modules_command", required=False)
+    modules_subparsers.add_parser("list", help="List detector modules and whether each is enabled")
+    mod_enable = modules_subparsers.add_parser("enable", help="Enable one or more detectors (or 'all')")
+    mod_enable.add_argument("names", nargs="+", metavar="NAME", help="Detector class name, key, or display name; or 'all'")
+    mod_disable = modules_subparsers.add_parser("disable", help="Disable one or more detectors (or 'all')")
+    mod_disable.add_argument("names", nargs="+", metavar="NAME", help="Detector class name, key, or display name; or 'all'")
 
     # Internal command used by start to keep the monitor alive after start exits.
     collector_parser = subparsers.add_parser("_collector", help=argparse.SUPPRESS)
@@ -2248,13 +2505,24 @@ def main():
 
     args = parser.parse_args()
 
+    if args.enable_modules:
+        if args.command:
+            parser.error("--enable-modules cannot be combined with a command")
+        cmd_enable_modules()
+        return
+
     if args.command == "set":
         if args.set_command == "module" and args.module_command == "path":
             cmd_set_module_path(args.path)
         else:
             parser.error("usage: cmdtrace set module path <directory>")
     elif args.command == "modules":
-        cmd_modules_list()
+        if args.modules_command == "enable":
+            cmd_set_detectors_enabled(args.names, enable=True)
+        elif args.modules_command == "disable":
+            cmd_set_detectors_enabled(args.names, enable=False)
+        else:
+            cmd_modules_list()
     elif args.command == "_collector":
         if args.backend == "python-inotify":
             sys.exit(_run_inotify_collector(Path(args.event_file)))
